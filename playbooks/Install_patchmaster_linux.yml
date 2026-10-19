@@ -63,6 +63,24 @@
         group: root
         mode: "0644"
 
+    - name: Verify required staged files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
+        - "{{ patchmaster_stage_dir }}/config.linux.example.json"
+        - "{{ patchmaster_stage_dir }}/install-linux.sh"
+        - "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
+      register: patchmaster_staged_files
+
+    - name: Stop if a required file is missing
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+        fail_msg: "A required PatchMaster installation file is missing."
+      loop: "{{ patchmaster_staged_files.results }}"
+
     - name: Install and start PatchMaster agent
       ansible.builtin.command: ./install-linux.sh
       args:
