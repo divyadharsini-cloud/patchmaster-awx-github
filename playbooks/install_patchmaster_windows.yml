@@ -1,0 +1,57 @@
+
+---
+- name: Install PatchMaster agent on Windows endpoints
+  hosts: windows_endpoints
+  gather_facts: false
+  serial: 1
+
+  vars:
+    patchmaster_stage_dir: 'C:\PatchMasterAgentStage'
+    patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/windows"
+
+  tasks:
+    - name: Validate PatchMaster credentials
+      ansible.builtin.assert:
+        that:
+          - patchmaster_api_url is defined
+          - patchmaster_api_url | length > 0
+          - patchmaster_bootstrap_token is defined
+          - patchmaster_bootstrap_token | length > 0
+        fail_msg: "Attach the PatchMaster custom credential."
+      no_log: true
+
+    - name: Create staging directory
+      ansible.windows.win_file:
+        path: "{{ patchmaster_stage_dir }}"
+        state: directory
+
+    - name: Copy agent files to endpoint
+      ansible.windows.win_copy:
+        src: "{{ patchmaster_package_dir }}/{{ item }}"
+        dest: "{{ patchmaster_stage_dir }}\\{{ item }}"
+      loop:
+        - endpoint-agent.exe
+        - config.windows.example.json
+        - install-windows.ps1
+
+    - name: Install and start the agent
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATCHMASTER_API_URL = '{{ patchmaster_api_url }}'
+          $env:PATCHMASTER_BOOTSTRAP_TOKEN = '{{ patchmaster_bootstrap_token }}'
+
+          Set-Location 'C:\PatchMasterAgentStage'
+          Unblock-File '.\install-windows.ps1'
+          & '.\install-windows.ps1'
+      no_log: true
+
+    - name: Verify agent scheduled task
+      ansible.windows.win_powershell:
+        script: |
+          $task = Get-ScheduledTask -TaskName 'EndpointAgentV1' -ErrorAction Stop
+          [PSCustomObject]@{
+            TaskName = $task.TaskName
+            State = $task.State
+          }
+      changed_when: false
