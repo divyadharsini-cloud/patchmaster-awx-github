@@ -1,4 +1,3 @@
-
 ---
 - name: Install PatchMaster agent on Windows endpoints
   hosts: DPDYPHGFDIS0454
@@ -20,12 +19,12 @@
         fail_msg: "Attach the PatchMaster custom credential."
       no_log: true
 
-    - name: Create staging directory
+    - name: Create PatchMaster staging directory
       ansible.windows.win_file:
         path: "{{ patchmaster_stage_dir }}"
         state: directory
 
-    - name: Copy agent files to endpoint
+    - name: Copy Windows agent package files
       ansible.windows.win_copy:
         src: "{{ patchmaster_package_dir }}/{{ item }}"
         dest: "{{ patchmaster_stage_dir }}\\{{ item }}"
@@ -34,24 +33,53 @@
         - config.windows.example.json
         - install-windows.ps1
 
-    - name: Install and start the agent
+    - name: Install and configure PatchMaster agent
       ansible.windows.win_powershell:
         script: |
           $ErrorActionPreference = 'Stop'
+
           $env:PATCHMASTER_API_URL = '{{ patchmaster_api_url }}'
           $env:PATCHMASTER_BOOTSTRAP_TOKEN = '{{ patchmaster_bootstrap_token }}'
 
-          Set-Location 'C:\PatchMasterAgentStage'
-          Unblock-File '.\install-windows.ps1'
-          & '.\install-windows.ps1'
+          $stageDir = 'C:\PatchMasterAgentStage'
+          $installer = Join-Path $stageDir 'install-windows.ps1'
+
+          if (-not (Test-Path $installer)) {
+              throw "PatchMaster installer not found: $installer"
+          }
+
+          Unblock-File -Path $installer
+          & $installer
+
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+              throw "PatchMaster installer exited with code $LASTEXITCODE"
+          }
       no_log: true
 
-    - name: Verify agent scheduled task
+    - name: Verify PatchMaster scheduled task
       ansible.windows.win_powershell:
         script: |
-          $task = Get-ScheduledTask -TaskName 'EndpointAgentV1' -ErrorAction Stop
+          $task = Get-ScheduledTask `
+              -TaskName 'EndpointAgentV1' `
+              -ErrorAction Stop
+
           [PSCustomObject]@{
-            TaskName = $task.TaskName
-            State = $task.State
+              TaskName = $task.TaskName
+              State    = $task.State
           }
       changed_when: false
+
+    - name: Verify PatchMaster agent executable
+      ansible.windows.win_stat:
+        path: 'C:\Program Files\PatchMaster\endpoint-agent.exe'
+      register: patchmaster_agent_exe
+      changed_when: false
+
+    - name: Report agent executable status
+      ansible.builtin.assert:
+        that:
+          - patchmaster_agent_exe.stat.exists
+        fail_msg: >-
+          The PatchMaster agent executable was not found at the expected
+          path. Check the installation path configured in install-windows.ps1.
+        success_msg: "PatchMaster agent executable exists."
