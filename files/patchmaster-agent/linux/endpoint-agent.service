@@ -1,0 +1,19 @@
+[Unit]
+Description=Endpoint Management Agent V1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/endpoint-agent -config /etc/endpoint-agent/config.json
+Restart=always
+RestartSec=15
+User=root
+EnvironmentFile=-/etc/endpoint-agent/agent.env
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/endpoint-agent /var/log/endpoint-agent -/etc/firefox/policies -/etc/opt/chrome/policies/managed
+
+[Install]
+WantedBy=multi-user.target
