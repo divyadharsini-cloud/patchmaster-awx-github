@@ -1,3 +1,4 @@
+```yaml
 ---
 - name: Install PatchMaster agent on Linux endpoints
   hosts: DPDYPH1FGLA0677
@@ -55,13 +56,28 @@
         group: root
         mode: "0750"
 
-    - name: Copy systemd service definition
+    - name: Create systemd service definition inline
       ansible.builtin.copy:
-        src: "{{ patchmaster_package_dir }}/deploy/endpoint-agent.service"
         dest: "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
         owner: root
         group: root
         mode: "0644"
+        content: |
+          [Unit]
+          Description=PatchMaster Endpoint Agent
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          Group=root
+          ExecStart=/usr/local/bin/endpoint-agent -config /etc/endpoint-agent/config.json
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
 
     - name: Verify required staged files
       ansible.builtin.stat:
@@ -98,4 +114,4 @@
     - name: Display service status
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: endpoint-agent is {{ patchmaster_linux_service.stdout }}"
-
+```
