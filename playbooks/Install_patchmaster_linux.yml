@@ -1,3 +1,4 @@
+```yaml
 ---
 - name: Install PatchMaster agent on Linux endpoints
   hosts: DPDYPH1FGLA0677
@@ -20,13 +21,16 @@
         fail_msg: "Attach the PatchMaster custom credential."
       no_log: true
 
-    - name: Create staging directory
+    - name: Create staging directories
       ansible.builtin.file:
-        path: "{{ patchmaster_stage_dir }}"
+        path: "{{ item }}"
         state: directory
         owner: root
         group: root
         mode: "0750"
+      loop:
+        - "{{ patchmaster_stage_dir }}"
+        - "{{ patchmaster_stage_dir }}/deploy"
 
     - name: Copy Linux agent binary
       ansible.builtin.copy:
@@ -52,18 +56,13 @@
         group: root
         mode: "0750"
 
-    - name: Verify Linux agent binary exists
-      ansible.builtin.stat:
-        path: "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
-      register: patchmaster_agent_binary
-
-    - name: Stop if the Linux agent binary is missing
-      ansible.builtin.assert:
-        that:
-          - patchmaster_agent_binary.stat.exists
-          - patchmaster_agent_binary.stat.isreg
-          - patchmaster_agent_binary.stat.executable
-        fail_msg: "The Linux agent binary is missing or not executable."
+    - name: Copy systemd service definition
+      ansible.builtin.copy:
+        src: "{{ patchmaster_package_dir }}/deploy/endpoint-agent.service"
+        dest: "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Install and start PatchMaster agent
       ansible.builtin.command: ./install-linux.sh
@@ -82,4 +81,4 @@
     - name: Display service status
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: endpoint-agent is {{ patchmaster_linux_service.stdout }}"
-
+```
