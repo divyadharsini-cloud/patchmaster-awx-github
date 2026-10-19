@@ -1,4 +1,3 @@
-```yaml
 ---
 - name: Install PatchMaster agent on Linux endpoints
   hosts: DPDYPH1FGLA0677
@@ -114,4 +113,4 @@
     - name: Display service status
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: endpoint-agent is {{ patchmaster_linux_service.stdout }}"
-```
+
