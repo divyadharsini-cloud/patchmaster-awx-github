@@ -1,0 +1,16 @@
+{
+  "agent_name": "endpoint-agent-v1",
+  "api_base_url": "http://172.17.6.142:5000",
+  "token_env": "ENDPOINT_AGENT_TOKEN",
+  "config_poll_seconds": 30,
+  "heartbeat_seconds": 60,
+  "inventory_seconds": 3600,
+  "http_timeout_seconds": 20,
+  "firefox_policy_path": "/etc/firefox/policies/policies.json",
+  "chrome_policy_path": "/etc/opt/chrome/policies/managed/endpoint-agent.json",
+  "state_file": "/var/lib/endpoint-agent/state.json",
+  "log_file": "/var/log/endpoint-agent/agent.log",
+  "allow_insecure_http": true,
+  "bootstrap_token_env": "PATCHMASTER_BOOTSTRAP_TOKEN",
+  "bootstrap_token": "REPLACE_WITH_TEST_BOOTSTRAP_SECRET"
+}
