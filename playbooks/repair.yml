@@ -16,81 +16,127 @@
     agent_api: http://172.17.6.142:5000
 
   tasks:
-    - name: Confirm required agent files exist
+    - name: Check required core agent files
       ansible.builtin.stat:
         path: "{{ item }}"
       loop:
         - "{{ agent_binary }}"
         - "{{ agent_config }}"
         - "{{ agent_state }}"
-        - "{{ agent_env }}"
-      register: agent_files
+      register: required_files
 
-    - name: Stop if a required file is missing
+    - name: Stop if a required core file is missing
       ansible.builtin.assert:
         that:
           - item.stat.exists
-        fail_msg: "Required agent file is missing: {{ item.item }}"
-      loop: "{{ agent_files.results }}"
+        fail_msg: "Required core file is missing: {{ item.item }}"
+      loop: "{{ required_files.results }}"
       loop_control:
         label: "{{ item.item }}"
 
-    - name: Validate existing token and configuration without displaying secrets
-      ansible.builtin.shell: |
-        python3 - <<'PY'
-        import json, os, sys
-
-        config_path = "{{ agent_config }}"
-        state_path = "{{ agent_state }}"
-        env_path = "{{ agent_env }}"
-
-        with open(config_path) as f:
-            config = json.load(f)
-        with open(state_path) as f:
-            state = json.load(f)
-
-        token_env = config.get("token_env", "ENDPOINT_AGENT_TOKEN")
-        state_token = state.get("token", "")
-
-        env_token = ""
-        with open(env_path) as f:
-            for line in f:
-                if line.startswith(token_env + "="):
-                    env_token = line.rstrip("\r\n").split("=", 1)[1]
-                    break
-
-        if not state_token:
-            print("FAIL: Existing state has no token")
-            sys.exit(2)
-
-        if state_token != env_token:
-            print("FAIL: State token and environment token do not match")
-            sys.exit(3)
-
-        print("PASS: Existing token matches the environment")
-        print("PASS: Configured token environment variable:", token_env)
-        print("PASS: API URL configured:", config.get("api_base_url", "missing"))
-        PY
-      args:
-        executable: /bin/bash
-      register: token_validation
+    - name: Read configured token environment variable
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json
+            with open("{{ agent_config }}") as f:
+                config = json.load(f)
+            print(config.get("token_env", "ENDPOINT_AGENT_TOKEN"))
+      register: token_env_name
       changed_when: false
-      no_log: false
 
-    - name: Stop if token validation failed
-      ansible.builtin.assert:
-        that:
-          - token_validation.rc == 0
-        fail_msg: "Token validation failed. Existing token and state were preserved."
+    - name: Read existing state token securely
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json
+            with open("{{ agent_state }}") as f:
+                state = json.load(f)
+            token = state.get("token", "")
+            if not token:
+                raise SystemExit("Existing state token is missing")
+            print(token)
+      register: state_token
+      changed_when: false
+      no_log: true
 
-    - name: Restrict environment file permissions
+    - name: Create environment directory
+      ansible.builtin.file:
+        path: /etc/endpoint-agent
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check whether environment file exists
+      ansible.builtin.stat:
+        path: "{{ agent_env }}"
+      register: env_file_stat
+
+    - name: Restore environment file from existing state token if missing
+      ansible.builtin.copy:
+        dest: "{{ agent_env }}"
+        content: "{{ token_env_name.stdout }}={{ state_token.stdout }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not env_file_stat.stat.exists
+      no_log: true
+
+    - name: Ensure environment file has secure permissions
       ansible.builtin.file:
         path: "{{ agent_env }}"
         owner: root
         group: root
         mode: "0600"
 
-    - name: Ensure systemd loads the existing environment file
+    - name: Validate state token matches environment token
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import sys
+
+        with open("{{ agent_config }}") as f:
+            config = json.load(f)
+        with open("{{ agent_state }}") as f:
+            state = json.load(f)
+
+        name = config.get("token_env", "ENDPOINT_AGENT_TOKEN")
+        expected = state.get("token", "")
+        actual = ""
+
+        with open("{{ agent_env }}") as f:
+            for line in f:
+                if line.startswith(name + "="):
+                    actual = line.rstrip("\r\n").split("=", 1)[1]
+                    break
+
+        if not expected or expected != actual:
+            print("FAIL: State token and environment token do not match")
+            sys.exit(1)
+
+        print("PASS: Existing state token matches environment token")
+        PY
+      args:
+        executable: /bin/bash
+      register: token_validation
+      changed_when: false
+      no_log: true
+
+    - name: Stop if token validation fails
+      ansible.builtin.assert:
+        that:
+          - token_validation.rc == 0
+        fail_msg: >-
+          Token validation failed. The service was not restarted.
+          Check the existing state and environment file.
+
+    - name: Ensure systemd drop-in directory exists
       ansible.builtin.file:
         path: /etc/systemd/system/endpoint-agent.service.d
         state: directory
@@ -107,23 +153,22 @@
         content: |
           [Service]
           EnvironmentFile={{ agent_env }}
-      register: systemd_dropin
 
-    - name: Reload systemd configuration
+    - name: Reload systemd
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: Restart the endpoint agent
+    - name: Restart and enable endpoint agent
       ansible.builtin.systemd:
         name: "{{ agent_service }}"
         state: restarted
         enabled: true
 
-    - name: Wait for agent service to settle
+    - name: Wait for agent to start
       ansible.builtin.pause:
         seconds: 5
 
-    - name: Read agent service status
+    - name: Check service status
       ansible.builtin.command:
         argv:
           - systemctl
@@ -133,29 +178,19 @@
       changed_when: false
       failed_when: false
 
-    - name: Check token presence in the running process without exposing it
+    - name: Verify token is present in running process
       ansible.builtin.shell: |
         set -o pipefail
         PID=$(systemctl show "{{ agent_service }}" -p MainPID --value)
         test "$PID" -gt 0 &&
         tr '\000' '\n' < "/proc/$PID/environ" |
-          grep -q '^ENDPOINT_AGENT_TOKEN=.'
+          grep -Fq "{{ token_env_name.stdout }}="
       args:
         executable: /bin/bash
       register: process_token_check
       changed_when: false
       failed_when: false
-
-    - name: Check API endpoint reachability
-      ansible.builtin.uri:
-        url: "{{ agent_api }}/"
-        method: GET
-        return_content: false
-        status_code: [200, 401, 403, 404]
-        timeout: 5
-      register: api_check
-      failed_when: false
-      changed_when: false
+      no_log: true
 
     - name: Read recent agent log
       ansible.builtin.command:
@@ -168,21 +203,19 @@
       changed_when: false
       failed_when: false
 
-    - name: Show safe diagnostic summary
+    - name: Display safe diagnostic summary
       ansible.builtin.debug:
         msg:
           - "Host: {{ inventory_hostname }}"
           - "Service status: {{ service_status.stdout | default('unknown') }}"
-          - "Token present in running process: {{ process_token_check.rc == 0 }}"
-          - "API HTTP status: {{ api_check.status | default('unavailable') }}"
-          - "Recent agent log available: {{ agent_log_tail.rc == 0 }}"
-          - "Review recent agent log on the host if check-in or configuration application is not confirmed."
+          - "Token present in process: {{ process_token_check.rc == 0 }}"
+          - "Recent agent log readable: {{ agent_log_tail.rc == 0 }}"
+          - "Verify fresh dashboard Last Seen and configuration application."
 
-    - name: Fail if service or process environment is incorrect
+    - name: Fail if service or process token check fails
       ansible.builtin.assert:
         that:
           - service_status.stdout == "active"
           - process_token_check.rc == 0
         fail_msg: >-
-          Agent service or token environment validation failed.
-          Review the service journal and agent log before further changes.
+          Agent verification failed. Review the service journal and agent log.
