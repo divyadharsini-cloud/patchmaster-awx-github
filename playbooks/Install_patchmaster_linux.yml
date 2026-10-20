@@ -1,6 +1,6 @@
 ---
 - name: Install PatchMaster agent on Linux endpoints
-  hosts: DTHNVCGFCON0096
+  hosts: THNGFITRM000506, TTHNGFFNLRM0505
   become: true
   gather_facts: false
   serial: 1
