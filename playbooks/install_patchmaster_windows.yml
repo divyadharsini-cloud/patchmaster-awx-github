@@ -6,7 +6,8 @@
   serial: 1
 
   vars:
-    ansible_ssh_transfer_method: sftp
+    ansible_ssh_transfer_method: scp
+    ansible_scp_extra_args: "-O"
 
     patchmaster_stage_dir: 'C:\PatchMasterAgentStage'
     patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/windows"
