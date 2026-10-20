@@ -1,58 +1,173 @@
 ---
-- name: Repair PatchMaster Linux endpoint agents
+- name: Repair PatchMaster Linux endpoint agent
   hosts: TTHNFHREFU01006
   become: true
   gather_facts: false
-  serial: 5
-  ignore_unreachable: true
+  serial: 1
 
   vars:
     patchmaster_config: /etc/endpoint-agent/config.json
     patchmaster_env_file: /etc/endpoint-agent/agent.env
+    patchmaster_state_file: /var/lib/endpoint-agent/state.json
     patchmaster_service: endpoint-agent
     patchmaster_api_url: "http://172.17.6.142:5000"
     patchmaster_log_file: /var/log/endpoint-agent/agent.log
 
   tasks:
-    - name: Check agent configuration exists
+    - name: Check agent configuration
       ansible.builtin.stat:
         path: "{{ patchmaster_config }}"
       register: agent_config_stat
 
-    - name: Check agent environment file exists
+    - name: Check agent state
+      ansible.builtin.stat:
+        path: "{{ patchmaster_state_file }}"
+      register: agent_state_stat
+
+    - name: Check agent environment file
       ansible.builtin.stat:
         path: "{{ patchmaster_env_file }}"
       register: agent_env_stat
 
-    - name: Stop if configuration or environment file is missing
+    - name: Stop if required configuration or state is missing
       ansible.builtin.assert:
         that:
           - agent_config_stat.stat.exists
-          - agent_env_stat.stat.exists
+          - agent_state_stat.stat.exists
         fail_msg: >-
-          Agent configuration or environment file is missing.
-          Check this host before attempting credential recovery.
+          Agent configuration or state file is missing.
+          Do not re-enroll automatically until the endpoint is investigated.
 
-    - name: Validate token configuration without displaying secrets
+    - name: Validate configuration and inspect token availability
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+
+        config_path = "/etc/endpoint-agent/config.json"
+        state_path = "/var/lib/endpoint-agent/state.json"
+        env_path = "/etc/endpoint-agent/agent.env"
+
+        with open(config_path) as f:
+            config = json.load(f)
+
+        if not config.get("api_base_url"):
+            raise SystemExit("api_base_url is missing")
+
+        if config.get("token_env") != "ENDPOINT_AGENT_TOKEN":
+            raise SystemExit("Unexpected token_env setting")
+
+        with open(state_path) as f:
+            state = json.load(f)
+
+        token = state.get("token")
+        if not isinstance(token, str) or not token.strip():
+            raise SystemExit(
+                "No endpoint token in state; enrollment recovery required"
+            )
+
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                lines = f.readlines()
+
+            found = any(
+                line.startswith("ENDPOINT_AGENT_TOKEN=")
+                and line.partition("=")[2].strip()
+                for line in lines
+            )
+
+            if found:
+                print("Existing endpoint environment token is configured")
+            else:
+                print("Environment file exists but endpoint token is missing")
+        else:
+            print("Environment file is missing")
+
+        print("Existing endpoint state token is available")
+        PY
+      args:
+        executable: /bin/bash
+      register: patchmaster_token_check
+      changed_when: false
+      no_log: true
+
+    - name: Create environment file from existing endpoint state token
       ansible.builtin.shell: |
         set -eu
         python3 - <<'PY'
         import json
-        p = "/etc/endpoint-agent/config.json"
-        with open(p) as f:
-            c = json.load(f)
-        assert c.get("api_base_url"), "api_base_url is missing"
-        assert c.get("token_env") == "ENDPOINT_AGENT_TOKEN", \
-            "token_env is not ENDPOINT_AGENT_TOKEN"
+        import os
+        import tempfile
+
+        state_path = "/var/lib/endpoint-agent/state.json"
+        env_path = "/etc/endpoint-agent/agent.env"
+        env_dir = os.path.dirname(env_path)
+
+        with open(state_path) as f:
+            state = json.load(f)
+
+        token = state.get("token")
+        if not isinstance(token, str) or not token.strip():
+            raise SystemExit("Cannot create environment file: state token missing")
+
+        os.makedirs(env_dir, mode=0o750, exist_ok=True)
+
+        fd, temp_path = tempfile.mkstemp(dir=env_dir)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("ENDPOINT_AGENT_TOKEN=" + token + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.chmod(temp_path, 0o600)
+            os.chown(temp_path, 0, 0)
+            os.replace(temp_path, env_path)
+            os.chmod(env_path, 0o600)
+            os.chown(env_path, 0, 0)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        print("Environment file created from this endpoint's existing state token")
         PY
-        grep -q '^ENDPOINT_AGENT_TOKEN=.' \
-          /etc/endpoint-agent/agent.env
+      args:
+        executable: /bin/bash
+      when: >-
+        not agent_env_stat.stat.exists
+        or
+        (
+          patchmaster_token_check.stdout is defined
+          and 'Environment file exists but endpoint token is missing'
+              in patchmaster_token_check.stdout
+        )
+      no_log: true
+
+    - name: Verify endpoint environment file
+      ansible.builtin.shell: |
+        set -eu
+        test -s /etc/endpoint-agent/agent.env
+        grep -q '^ENDPOINT_AGENT_TOKEN=.' /etc/endpoint-agent/agent.env
       args:
         executable: /bin/bash
       changed_when: false
       no_log: true
 
-    - name: Create dedicated systemd environment drop-in
+    - name: Ensure environment file is protected
+      ansible.builtin.file:
+        path: "{{ patchmaster_env_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Create systemd environment drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/endpoint-agent.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure systemd to load endpoint token
       ansible.builtin.copy:
         dest: /etc/systemd/system/endpoint-agent.service.d/10-agent-env.conf
         owner: root
@@ -61,13 +176,6 @@
         content: |
           [Service]
           EnvironmentFile=/etc/endpoint-agent/agent.env
-
-    - name: Ensure environment file is protected
-      ansible.builtin.file:
-        path: "{{ patchmaster_env_file }}"
-        owner: root
-        group: root
-        mode: "0600"
 
     - name: Reload systemd
       ansible.builtin.systemd:
@@ -85,7 +193,7 @@
       register: patchmaster_api_check
       changed_when: false
 
-    - name: Restart and enable PatchMaster agent
+    - name: Restart and enable agent
       ansible.builtin.systemd:
         name: "{{ patchmaster_service }}"
         enabled: true
@@ -93,62 +201,74 @@
 
     - name: Wait for agent startup
       ansible.builtin.pause:
-        seconds: 15
+        seconds: 20
 
-    - name: Check agent service status
-      ansible.builtin.command: systemctl is-active endpoint-agent
+    - name: Check service status
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ patchmaster_service }}"
       register: patchmaster_service_status
       changed_when: false
       failed_when: false
 
-    - name: Read recent agent logs
+    - name: Read recent agent log
       ansible.builtin.command:
         argv:
           - tail
           - -n
-          - "40"
+          - "60"
           - "{{ patchmaster_log_file }}"
       register: patchmaster_agent_logs
       changed_when: false
       failed_when: false
 
-    - name: Check for recent startup or authentication errors
-      ansible.builtin.shell: |
-        journalctl -u endpoint-agent --since "3 minutes ago" \
-          --no-pager -o cat
-      args:
-        executable: /bin/bash
+    - name: Read recent service journal
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - -u
+          - "{{ patchmaster_service }}"
+          - --since
+          - "3 minutes ago"
+          - --no-pager
+          - -o
+          - cat
       register: patchmaster_recent_journal
       changed_when: false
       failed_when: false
 
-    - name: Report repair result
+    - name: Display repair summary
       ansible.builtin.debug:
         msg:
           - "Host: {{ inventory_hostname }}"
+          - "Service: {{ patchmaster_service }}"
           - "Service status: {{ patchmaster_service_status.stdout | default('unknown') }}"
           - "API HTTP status: {{ patchmaster_api_check.status | default('unavailable') }}"
-          - "Recent service messages:"
+          - "Recent journal:"
           - "{{ patchmaster_recent_journal.stdout_lines | default([]) }}"
           - "Recent agent log:"
           - "{{ patchmaster_agent_logs.stdout_lines | default([]) }}"
 
-    - name: Flag hosts that need further investigation
+    - name: Flag service failures
       ansible.builtin.fail:
         msg: >-
-          Agent service is not active or recent logs require investigation.
-          Review the preceding output for this host.
+          Agent service is not active. Review the logs above.
+      when: patchmaster_service_status.stdout | default('') != 'active'
+
+    - name: Flag authentication or configuration errors
+      ansible.builtin.fail:
+        msg: >-
+          Agent is running but logs contain a configuration or authentication
+          error. Further investigation is required.
       when: >-
-        patchmaster_service_status.stdout | default('') != 'active'
-        or
         (
           (
-            (
-              patchmaster_recent_journal.stdout
-              | default('')
-              ~ '\n'
-              ~ (patchmaster_agent_logs.stdout | default(''))
-            )
-            | lower
-          ) is search('load config:|unauthorized|http 401|authentication failed')
+            (patchmaster_recent_journal.stdout | default(''))
+            ~ '\n'
+            ~ (patchmaster_agent_logs.stdout | default(''))
+          ) | lower
+        ) is search(
+          'load config:|unauthorized|http 401|authentication failed'
         )
