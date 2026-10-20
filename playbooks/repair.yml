@@ -1,0 +1,154 @@
+---
+- name: Repair PatchMaster Linux endpoint agents
+  hosts: TTHNFHREFU01006
+  become: true
+  gather_facts: false
+  serial: 5
+  ignore_unreachable: true
+
+  vars:
+    patchmaster_config: /etc/endpoint-agent/config.json
+    patchmaster_env_file: /etc/endpoint-agent/agent.env
+    patchmaster_service: endpoint-agent
+    patchmaster_api_url: "http://172.17.6.142:5000"
+    patchmaster_log_file: /var/log/endpoint-agent/agent.log
+
+  tasks:
+    - name: Check agent configuration exists
+      ansible.builtin.stat:
+        path: "{{ patchmaster_config }}"
+      register: agent_config_stat
+
+    - name: Check agent environment file exists
+      ansible.builtin.stat:
+        path: "{{ patchmaster_env_file }}"
+      register: agent_env_stat
+
+    - name: Stop if configuration or environment file is missing
+      ansible.builtin.assert:
+        that:
+          - agent_config_stat.stat.exists
+          - agent_env_stat.stat.exists
+        fail_msg: >-
+          Agent configuration or environment file is missing.
+          Check this host before attempting credential recovery.
+
+    - name: Validate token configuration without displaying secrets
+      ansible.builtin.shell: |
+        set -eu
+        python3 - <<'PY'
+        import json
+        p = "/etc/endpoint-agent/config.json"
+        with open(p) as f:
+            c = json.load(f)
+        assert c.get("api_base_url"), "api_base_url is missing"
+        assert c.get("token_env") == "ENDPOINT_AGENT_TOKEN", \
+            "token_env is not ENDPOINT_AGENT_TOKEN"
+        PY
+        grep -q '^ENDPOINT_AGENT_TOKEN=.' \
+          /etc/endpoint-agent/agent.env
+      args:
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+
+    - name: Create dedicated systemd environment drop-in
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/endpoint-agent.service.d/10-agent-env.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          EnvironmentFile=/etc/endpoint-agent/agent.env
+
+    - name: Ensure environment file is protected
+      ansible.builtin.file:
+        path: "{{ patchmaster_env_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Check API server reachability
+      ansible.builtin.uri:
+        url: "{{ patchmaster_api_url }}/"
+        method: GET
+        return_content: false
+        timeout: 10
+        status_code:
+          - 200
+          - 404
+      register: patchmaster_api_check
+      changed_when: false
+
+    - name: Restart and enable PatchMaster agent
+      ansible.builtin.systemd:
+        name: "{{ patchmaster_service }}"
+        enabled: true
+        state: restarted
+
+    - name: Wait for agent startup
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Check agent service status
+      ansible.builtin.command: systemctl is-active endpoint-agent
+      register: patchmaster_service_status
+      changed_when: false
+      failed_when: false
+
+    - name: Read recent agent logs
+      ansible.builtin.command:
+        argv:
+          - tail
+          - -n
+          - "40"
+          - "{{ patchmaster_log_file }}"
+      register: patchmaster_agent_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Check for recent startup or authentication errors
+      ansible.builtin.shell: |
+        journalctl -u endpoint-agent --since "3 minutes ago" \
+          --no-pager -o cat
+      args:
+        executable: /bin/bash
+      register: patchmaster_recent_journal
+      changed_when: false
+      failed_when: false
+
+    - name: Report repair result
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Service status: {{ patchmaster_service_status.stdout | default('unknown') }}"
+          - "API HTTP status: {{ patchmaster_api_check.status | default('unavailable') }}"
+          - "Recent service messages:"
+          - "{{ patchmaster_recent_journal.stdout_lines | default([]) }}"
+          - "Recent agent log:"
+          - "{{ patchmaster_agent_logs.stdout_lines | default([]) }}"
+
+    - name: Flag hosts that need further investigation
+      ansible.builtin.fail:
+        msg: >-
+          Agent service is not active or recent logs require investigation.
+          Review the preceding output for this host.
+      when: >-
+        patchmaster_service_status.stdout | default('') != 'active'
+        or
+        (
+          (
+            (
+              patchmaster_recent_journal.stdout
+              | default('')
+              ~ '\n'
+              ~ (patchmaster_agent_logs.stdout | default(''))
+            )
+            | lower
+          ) is search('load config:|unauthorized|http 401|authentication failed')
+        )
