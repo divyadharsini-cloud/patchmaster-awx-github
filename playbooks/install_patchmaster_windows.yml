@@ -1,3 +1,4 @@
+
 ---
 - name: Install PatchMaster agent on Windows endpoints
   hosts: DTHNFHGFCON0077
@@ -6,13 +7,21 @@
 
   vars:
     ansible_ssh_transfer_method: sftp
+
     patchmaster_stage_dir: 'C:\PatchMasterAgentStage'
     patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/windows"
-    patchmaster_install_dir: 'C:\Program Files\PatchMaster'
+    patchmaster_install_dir: 'C:\Program Files\EndpointAgent'
+    patchmaster_data_dir: 'C:\ProgramData\EndpointAgent'
     patchmaster_task_name: 'EndpointAgentV1'
 
+    patchmaster_package_files:
+      - endpoint-agent.exe
+      - config.windows.example.json
+      - install-windows.ps1
+
   tasks:
-    # 1. Validate credentials
+
+    # 1. Validate AWX credentials
     - name: Validate PatchMaster credentials
       ansible.builtin.assert:
         that:
@@ -20,135 +29,179 @@
           - patchmaster_api_url | length > 0
           - patchmaster_bootstrap_token is defined
           - patchmaster_bootstrap_token | length > 0
-        fail_msg: "Attach the PatchMaster custom credential."
+        fail_msg: >-
+          Configure patchmaster_api_url and patchmaster_bootstrap_token
+          using the AWX custom credential.
       no_log: true
 
-    # 2. Validate source files on the AWX execution environment
+    # 2. Validate package files on the AWX execution environment
     - name: Check Windows agent package files
       ansible.builtin.stat:
         path: "{{ patchmaster_package_dir }}/{{ item }}"
-      loop:
-        - endpoint-agent.exe
-        - config.windows.example.json
-        - install-windows.ps1
+      loop: "{{ patchmaster_package_files }}"
       delegate_to: localhost
       become: false
-      register: package_files
+      register: patchmaster_source_files
 
-    - name: Stop if a package file is missing
+    - name: Stop if any source package file is missing
       ansible.builtin.assert:
         that:
           - item.stat.exists
           - item.stat.isreg
-        fail_msg: "Missing Windows package file: {{ item.item }}"
-      loop: "{{ package_files.results }}"
+          - item.stat.size | int > 0
+        fail_msg: "Missing or empty source package file: {{ item.item }}"
+      loop: "{{ patchmaster_source_files.results }}"
       loop_control:
         label: "{{ item.item }}"
 
-    # 3. Create staging directory on Windows
+    # 3. Verify SSH connection before transferring files
+    - name: Verify Windows SSH command access
+      ansible.windows.win_powershell:
+        script: |
+          [PSCustomObject]@{
+              Hostname = $env:COMPUTERNAME
+              Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          }
+      register: patchmaster_ssh_check
+      changed_when: false
+
+    # 4. Create staging directory
     - name: Create PatchMaster staging directory
       ansible.windows.win_file:
         path: "{{ patchmaster_stage_dir }}"
         state: directory
 
-    # 4. Copy agent package files using SFTP transfer
+    # 5. Copy package files using SFTP
     - name: Copy Windows agent package files
       ansible.windows.win_copy:
         src: "{{ patchmaster_package_dir }}/{{ item }}"
         dest: "{{ patchmaster_stage_dir }}\\{{ item }}"
-      loop:
-        - endpoint-agent.exe
-        - config.windows.example.json
-        - install-windows.ps1
+      loop: "{{ patchmaster_package_files }}"
+      loop_control:
+        label: "{{ item }}"
 
-    # 5. Verify staged files
+    # 6. Verify every transferred file
     - name: Verify staged package files
       ansible.windows.win_stat:
         path: "{{ patchmaster_stage_dir }}\\{{ item }}"
-      loop:
-        - endpoint-agent.exe
-        - config.windows.example.json
-        - install-windows.ps1
-      register: staged_files
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: "{{ patchmaster_package_files }}"
+      register: patchmaster_staged_files
 
-    - name: Stop if a staged package file is missing
+    - name: Stop if any staged package file is missing or empty
       ansible.builtin.assert:
         that:
           - item.stat.exists
           - item.stat.isreg
-        fail_msg: "File transfer failed: {{ item.item }}"
-      loop: "{{ staged_files.results }}"
+          - item.stat.size | int > 0
+        fail_msg: "Package transfer failed for {{ item.item }}."
+      loop: "{{ patchmaster_staged_files.results }}"
       loop_control:
         label: "{{ item.item }}"
 
-    # 6. Install and configure agent
+    # 7. Install and enroll the agent
     - name: Install and configure PatchMaster agent
       ansible.windows.win_powershell:
+        chdir: "{{ patchmaster_stage_dir }}"
         script: |
           $ErrorActionPreference = 'Stop'
 
-          $env:PATCHMASTER_API_URL = '{{ patchmaster_api_url }}'
-          $env:PATCHMASTER_BOOTSTRAP_TOKEN = '{{ patchmaster_bootstrap_token }}'
+          $env:PATCHMASTER_API_URL = $env:AWX_PATCHMASTER_API_URL
+          $env:PATCHMASTER_BOOTSTRAP_TOKEN = $env:AWX_PATCHMASTER_BOOTSTRAP_TOKEN
 
-          $stageDir = 'C:\PatchMasterAgentStage'
-          $installer = Join-Path $stageDir 'install-windows.ps1'
+          $installer = Join-Path (Get-Location).Path 'install-windows.ps1'
+          $agent = Join-Path (Get-Location).Path 'endpoint-agent.exe'
+          $exampleConfig = Join-Path (Get-Location).Path 'config.windows.example.json'
 
-          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-              throw "PatchMaster installer not found: $installer"
+          foreach ($file in @($installer, $agent, $exampleConfig)) {
+              if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+                  throw "Required package file is missing: $file"
+              }
           }
 
           Unblock-File -LiteralPath $installer
 
           & $installer
 
-          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
-              throw "PatchMaster installer exited with code $LASTEXITCODE"
+          $task = Get-ScheduledTask `
+              -TaskName 'EndpointAgentV1' `
+              -ErrorAction Stop
+
+          $installedAgent = 'C:\Program Files\EndpointAgent\endpoint-agent.exe'
+          $installedConfig = 'C:\ProgramData\EndpointAgent\config.json'
+
+          if (-not (Test-Path -LiteralPath $installedAgent -PathType Leaf)) {
+              throw 'PatchMaster agent executable was not installed.'
           }
 
-          if ($Error.Count -gt 0) {
-              # Do not treat historical PowerShell errors as installation failures.
+          if (-not (Test-Path -LiteralPath $installedConfig -PathType Leaf)) {
+              throw 'PatchMaster configuration file was not created.'
           }
+
+          [PSCustomObject]@{
+              Hostname = $env:COMPUTERNAME
+              TaskName = $task.TaskName
+              TaskState = $task.State.ToString()
+              ExecutablePresent = $true
+              ConfigurationPresent = $true
+          } | ConvertTo-Json -Compress
+      environment:
+        AWX_PATCHMASTER_API_URL: "{{ patchmaster_api_url }}"
+        AWX_PATCHMASTER_BOOTSTRAP_TOKEN: "{{ patchmaster_bootstrap_token }}"
+      register: patchmaster_install_result
       no_log: true
 
-    # 7. Verify scheduled task
+    # 8. Verify scheduled task
     - name: Verify PatchMaster scheduled task
       ansible.windows.win_powershell:
         script: |
           $task = Get-ScheduledTask `
-              -TaskName '{{ patchmaster_task_name }}' `
+              -TaskName 'EndpointAgentV1' `
               -ErrorAction Stop
 
           [PSCustomObject]@{
               TaskName = $task.TaskName
-              State    = $task.State
+              State = $task.State.ToString()
           }
-      register: scheduled_task_check
+      register: patchmaster_task_check
       changed_when: false
 
-    # 8. Verify agent executable
-    - name: Verify PatchMaster agent executable
+    # 9. Verify installed executable
+    - name: Verify PatchMaster executable
       ansible.windows.win_stat:
         path: "{{ patchmaster_install_dir }}\\endpoint-agent.exe"
-      register: patchmaster_agent_exe
+      register: patchmaster_exe_check
       changed_when: false
 
-    - name: Assert installation completed
+    # 10. Verify agent configuration file
+    - name: Verify PatchMaster configuration file
+      ansible.windows.win_stat:
+        path: "{{ patchmaster_data_dir }}\\config.json"
+      register: patchmaster_config_check
+      changed_when: false
+
+    # 11. Final installation assertion
+    - name: Confirm PatchMaster installation
       ansible.builtin.assert:
         that:
-          - patchmaster_agent_exe.stat.exists
-          - scheduled_task_check is succeeded
+          - patchmaster_exe_check.stat.exists
+          - patchmaster_config_check.stat.exists
+          - patchmaster_task_check is succeeded
+          - patchmaster_install_result is succeeded
         fail_msg: >-
-          Installation verification failed. Check the installer script,
-          scheduled task configuration, and actual installation path.
+          PatchMaster installation verification failed.
+          Review the AWX job output and target agent logs.
         success_msg: >-
-          PatchMaster agent executable exists and the scheduled task
-          was found.
+          PatchMaster executable, configuration file, and scheduled
+          task were verified successfully.
 
-    # 9. Report safe result
+    # 12. Report safe installation result
     - name: Report PatchMaster installation result
       ansible.builtin.debug:
         msg:
-          - "Host: {{ inventory_hostname }}"
-          - "Agent executable: {{ patchmaster_agent_exe.stat.path }}"
+          - "Target host: {{ inventory_hostname }}"
+          - "Installation directory: {{ patchmaster_install_dir }}"
           - "Scheduled task: {{ patchmaster_task_name }}"
-          - "Installation verification completed."
+          - "Installation verification: successful"
+          - "Dashboard enrollment: verify the latest check-in separately."
