@@ -1,6 +1,6 @@
 ---
 - name: Repair and verify PatchMaster Linux endpoint agent
-  hosts: TTHNPHGFU010082
+  hosts: theniroot-HP-ProDesk-400-G2-MT, DTHNCCFDRE0092
   become: true
   gather_facts: false
   serial: 1
