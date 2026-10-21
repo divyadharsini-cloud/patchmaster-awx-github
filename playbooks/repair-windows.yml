@@ -1,0 +1,215 @@
+
+---
+- name: Repair PatchMaster Windows Agent Startup
+  hosts: DTHNVCGFCON0100
+  gather_facts: false
+  serial: 1
+
+  vars:
+    agent_name: EndpointAgentV1
+    agent_root: 'C:\Program Files\EndpointAgent'
+    agent_data: 'C:\ProgramData\EndpointAgent'
+    agent_exe: 'C:\Program Files\EndpointAgent\endpoint-agent.exe'
+    agent_config: 'C:\ProgramData\EndpointAgent\config.json'
+    agent_state: 'C:\ProgramData\EndpointAgent\state.json'
+    agent_wrapper: 'C:\ProgramData\EndpointAgent\run-agent.ps1'
+    agent_log_dir: 'C:\ProgramData\EndpointAgent\logs'
+
+  tasks:
+    - name: Verify required agent files exist
+      ansible.windows.win_powershell:
+        script: |
+          $required = @(
+            '{{ agent_exe }}',
+            '{{ agent_config }}',
+            '{{ agent_state }}'
+          )
+
+          foreach ($file in $required) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Required agent file is missing: $file"
+            }
+          }
+
+          $config = Get-Content '{{ agent_config }}' -Raw |
+            ConvertFrom-Json
+          $state = Get-Content '{{ agent_state }}' -Raw |
+            ConvertFrom-Json
+
+          if ([string]::IsNullOrWhiteSpace([string]$config.api_base_url)) {
+            throw "Agent API URL is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace([string]$config.token_env)) {
+            throw "Agent token_env is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace([string]$state.token)) {
+            throw "No existing endpoint token found. Enrollment is required."
+          }
+
+          $Ansible.Result = @{
+            api_url = $config.api_base_url
+            token_present = $true
+            config_valid = $true
+          }
+          $Ansible.Changed = $false
+      register: agent_precheck
+
+    - name: Create agent log directory
+      ansible.windows.win_file:
+        path: '{{ agent_log_dir }}'
+        state: directory
+
+    - name: Install persistent agent wrapper
+      ansible.windows.win_copy:
+        dest: '{{ agent_wrapper }}'
+        content: |
+          $ErrorActionPreference = "Stop"
+
+          $base = "C:\ProgramData\EndpointAgent"
+          $exe = "C:\Program Files\EndpointAgent\endpoint-agent.exe"
+          $configPath = "$base\config.json"
+          $statePath = "$base\state.json"
+          $wrapperLog = "$base\logs\agent-wrapper.log"
+
+          try {
+              $config = Get-Content $configPath -Raw |
+                  ConvertFrom-Json
+              $state = Get-Content $statePath -Raw |
+                  ConvertFrom-Json
+
+              $tokenName = [string]$config.token_env
+              $token = [string]$state.token
+
+              if ([string]::IsNullOrWhiteSpace($token)) {
+                  throw "Existing endpoint token is missing."
+              }
+
+              if (-not (Test-Path $exe -PathType Leaf)) {
+                  throw "Agent executable is missing."
+              }
+
+              [Environment]::SetEnvironmentVariable(
+                  $tokenName, $token, "Process"
+              )
+
+              "[$(Get-Date -Format o)] Starting agent." |
+                  Add-Content -Path $wrapperLog
+
+              & $exe -config $configPath 2>&1 |
+                  ForEach-Object {
+                      $_.ToString() |
+                          Add-Content -Path $wrapperLog
+                  }
+
+              $code = $LASTEXITCODE
+              "[$(Get-Date -Format o)] Agent exited: $code" |
+                  Add-Content -Path $wrapperLog
+
+              exit $code
+          }
+          catch {
+              "[$(Get-Date -Format o)] Wrapper error: $($_.Exception.Message)" |
+                  Add-Content -Path $wrapperLog
+              exit 1
+          }
+          finally {
+              if ($tokenName) {
+                  [Environment]::SetEnvironmentVariable(
+                      $tokenName, $null, "Process"
+                  )
+              }
+          }
+        force: true
+
+    - name: Restrict agent data directory permissions
+      ansible.windows.win_powershell:
+        script: |
+          & icacls '{{ agent_data }}' /inheritance:r `
+            /grant:r 'SYSTEM:(OI)(CI)F' `
+            'Administrators:(OI)(CI)F' | Out-Null
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to secure agent data directory."
+          }
+
+    - name: Register agent task to run at Windows startup
+      ansible.windows.win_powershell:
+        script: |
+          $taskName = '{{ agent_name }}'
+          $wrapper = '{{ agent_wrapper }}'
+
+          $action = New-ScheduledTaskAction `
+            -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$wrapper`""
+
+          $trigger = New-ScheduledTaskTrigger -AtStartup
+
+          $principal = New-ScheduledTaskPrincipal `
+            -UserId "SYSTEM" `
+            -LogonType ServiceAccount `
+            -RunLevel Highest
+
+          $settings = New-ScheduledTaskSettingsSet `
+            -StartWhenAvailable `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -MultipleInstances IgnoreNew `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries
+
+          Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Description "PatchMaster Windows endpoint agent startup" `
+            -Force | Out-Null
+
+          $Ansible.Changed = $true
+
+    - name: Start the agent task
+      ansible.windows.win_powershell:
+        script: |
+          Start-ScheduledTask -TaskName '{{ agent_name }}'
+          Start-Sleep -Seconds 5
+
+          $task = Get-ScheduledTask -TaskName '{{ agent_name }}'
+          $Ansible.Result = @{
+            task_state = [string]$task.State
+          }
+
+    - name: Verify agent process and task action
+      ansible.windows.win_powershell:
+        script: |
+          $task = Get-ScheduledTask -TaskName '{{ agent_name }}'
+          $info = Get-ScheduledTaskInfo -TaskName '{{ agent_name }}'
+
+          $process = Get-CimInstance Win32_Process |
+            Where-Object {
+              $_.Name -eq 'endpoint-agent.exe' -and
+              $_.ExecutablePath -eq '{{ agent_exe }}'
+            } |
+            Select-Object -First 1
+
+          $action = $task.Actions | Select-Object -First 1
+
+          $Ansible.Result = @{
+            task_state = [string]$task.State
+            last_run = $info.LastRunTime.ToString()
+            last_result = $info.LastTaskResult
+            agent_process_running = ($null -ne $process)
+            action_executable = $action.Execute
+            action_arguments = $action.Arguments
+          }
+
+          if ($null -eq $process) {
+            throw "Agent process is not running. Check agent-wrapper.log."
+          }
+
+          if ($action.Arguments -notmatch 'run-agent\.ps1') {
+            throw "Scheduled task is not configured to launch the wrapper."
+          }
