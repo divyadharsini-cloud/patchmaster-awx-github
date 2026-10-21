@@ -1,6 +1,6 @@
 ---
 - name: Install PatchMaster agent on Linux endpoints
-  hosts: DTHNCCFDRE0092, theniroot-HP-ProDesk-400-G2-MT
+  hosts: TTHNGFFNLRM0505, TTHNPH1FU020064, TTHNPHFU010071, TTHNPHGFHIT0111, TTHNPHGFU010067, TTHNPHGFU010068, DTHNPH1FOPT0113, DTHNPHGFHIT0200
   become: true
   gather_facts: false
   serial: 1
