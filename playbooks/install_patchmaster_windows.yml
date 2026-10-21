@@ -1,7 +1,7 @@
 
 ---
 - name: Install PatchMaster agent on Windows endpoints
-  hosts: DTHNPHGFMED0021
+  hosts: DTHNPHGFHIT0200
   gather_facts: false
   serial: 1
 
