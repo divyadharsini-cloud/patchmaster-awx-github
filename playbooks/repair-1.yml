@@ -1,7 +1,7 @@
 
 ---
 - name: Repair and verify PatchMaster Linux endpoint agent
-  hosts: DTHNVCGFCON0106
+  hosts: DTHNPH2FTHE0048
   become: true
   gather_facts: false
   serial: 1
