@@ -1,6 +1,6 @@
 ---
 - name: Repair and verify PatchMaster Linux endpoint agent
-  hosts: old, new
+  hosts: DPDYPHGFSTO0116, DPDYPH1FCMP0049, DPDYPH1FMIC0706, DPDYPH1FQAC0072, DPDYPH1FVCC0585, DPDYPH1FVCD0578, DPDYPH1FVCD0584, DPDYPHGCAL0608, DPDYPHGFCAL0609
   become: true
   gather_facts: false
   serial: 1
