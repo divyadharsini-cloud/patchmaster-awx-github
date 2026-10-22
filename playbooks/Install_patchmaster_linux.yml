@@ -1,6 +1,6 @@
 ---
 - name: Install PatchMaster agent on Linux endpoints
-  hosts: DPDYPHGFSTO0116, DPDYPH1FCMP0049, DPDYPH1FMIC0706, DPDYPH1FQAC0072, DPDYPH1FVCC0585, DPDYPH1FVCD0578, DPDYPH1FVCD0584, DPDYPHGCAL0608, DPDYPHGFCAL0609, DPDYPHGFPCD0548
+  hosts: old, new
   become: true
   gather_facts: false
   serial: 1
