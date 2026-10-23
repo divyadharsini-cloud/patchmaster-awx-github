@@ -3,7 +3,7 @@
   hosts: old, new
   become: true
   gather_facts: false
-  serial: 1
+
 
   vars:
     patchmaster_stage_dir: /tmp/patchmaster-agent-stage
