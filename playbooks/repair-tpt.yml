@@ -1,0 +1,303 @@
+---
+- name: Repair and verify PatchMaster Linux endpoint agent
+  hosts: old, new
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars:
+    agent_service: endpoint-agent
+    agent_binary: /usr/local/bin/endpoint-agent
+    agent_config: /etc/endpoint-agent/config.json
+    agent_state: /var/lib/endpoint-agent/state.json
+    agent_env: /etc/endpoint-agent/agent.env
+    agent_log: /var/log/endpoint-agent/agent.log
+    agent_dropin_dir: /etc/systemd/system/endpoint-agent.service.d
+    agent_dropin: /etc/systemd/system/endpoint-agent.service.d/10-agent-env.conf
+
+  tasks:
+    - name: Check agent files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ agent_binary }}"
+        - "{{ agent_config }}"
+        - "{{ agent_state }}"
+      register: agent_files
+
+    - name: Stop if required agent files are missing
+      ansible.builtin.assert:
+        that:
+          - agent_files.results | length == 3
+          - agent_files.results[0].stat.exists
+          - agent_files.results[1].stat.exists
+          - agent_files.results[2].stat.exists
+        fail_msg: >-
+          Required agent binary, configuration, or state file is missing.
+          No repair was attempted.
+
+    - name: Read token variable name from agent configuration
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json
+            with open("/etc/endpoint-agent/config.json") as f:
+                c = json.load(f)
+            name = c.get("token_env", "ENDPOINT_AGENT_TOKEN")
+            if name not in ("ENDPOINT_AGENT_TOKEN", "PATCHMASTER_BOOTSTRAP_TOKEN"):
+                raise SystemExit("Unsupported token environment variable")
+            print(name)
+      register: token_env_name
+      changed_when: false
+
+    - name: Read existing token from agent state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json
+            with open("/var/lib/endpoint-agent/state.json") as f:
+                s = json.load(f)
+            token = s.get("token", "")
+            if not isinstance(token, str) or not token.strip():
+                raise SystemExit(2)
+            print(token)
+      register: state_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Check whether the environment file exists
+      ansible.builtin.stat:
+        path: "{{ agent_env }}"
+      register: env_file_stat
+
+    - name: Check whether the environment token exists and matches state
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import os, sys
+            name, state_token, env_file = sys.argv[1:4]
+            value = ""
+            try:
+                with open(env_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith(name + "="):
+                            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+            except FileNotFoundError:
+                pass
+            sys.exit(0 if value and value == state_token else 1)
+          - "{{ token_env_name.stdout }}"
+          - "{{ state_token.stdout | default('') }}"
+          - "{{ agent_env }}"
+      register: env_token_check
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: state_token.rc == 0
+
+    - name: Report when token is absent from both sources
+      ansible.builtin.fail:
+        msg: >-
+          No usable token was found in the agent state file.
+          Automatic recovery cannot continue. Obtain a valid endpoint token
+          or perform supported bootstrap enrollment, then run this playbook again.
+      when: state_token.rc != 0
+
+    - name: Create agent configuration directory
+      ansible.builtin.file:
+        path: /etc/endpoint-agent
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Restore token in environment file when missing or incorrect
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import os, sys, tempfile
+            name, token, path = sys.argv[1:4]
+
+            try:
+                with open(path) as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+
+            result = []
+            inserted = False
+            for line in lines:
+                if line.strip().startswith(name + "="):
+                    if not inserted:
+                        result.append(f"{name}={token}\n")
+                        inserted = True
+                else:
+                    result.append(line)
+
+            if not inserted:
+                result.append(f"{name}={token}\n")
+
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.writelines(result)
+                os.chmod(tmp, 0o600)
+                os.chown(tmp, 0, 0)
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+          - "{{ token_env_name.stdout }}"
+          - "{{ state_token.stdout }}"
+          - "{{ agent_env }}"
+      when: env_token_check.rc != 0
+      no_log: true
+      changed_when: true
+
+    - name: Ensure environment file has secure permissions
+      ansible.builtin.file:
+        path: "{{ agent_env }}"
+        state: file
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Create systemd drop-in directory
+      ansible.builtin.file:
+        path: "{{ agent_dropin_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure systemd loads agent environment file
+      ansible.builtin.copy:
+        dest: "{{ agent_dropin }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          EnvironmentFile={{ agent_env }}
+      register: dropin_result
+
+    - name: Reload systemd configuration
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: dropin_result.changed
+
+    - name: Enable and restart endpoint agent
+      ansible.builtin.systemd:
+        name: "{{ agent_service }}"
+        enabled: true
+        state: restarted
+
+    - name: Wait for agent startup
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Check agent service status
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ agent_service }}"
+      register: service_status
+      changed_when: false
+      failed_when: false
+
+    - name: Verify the running process received the correct token
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import json, os, subprocess, sys
+            name, state_path, config_path, service = sys.argv[1:5]
+
+            with open(state_path) as f:
+                state = json.load(f)
+            expected = state.get("token", "")
+            if not expected:
+                raise SystemExit("State token missing")
+
+            with open(config_path) as f:
+                config = json.load(f)
+            configured_name = config.get("token_env", "ENDPOINT_AGENT_TOKEN")
+            if configured_name != name:
+                raise SystemExit("Token variable mismatch")
+
+            pid_text = subprocess.check_output(
+                ["systemctl", "show", service, "-p", "MainPID", "--value"],
+                text=True
+            ).strip()
+            if not pid_text.isdigit() or int(pid_text) <= 0:
+                raise SystemExit("No running agent PID")
+
+            with open("/proc/" + pid_text + "/environ", "rb") as f:
+                entries = f.read().split(b"\0")
+
+            prefix = (name + "=").encode()
+            actual = None
+            for entry in entries:
+                if entry.startswith(prefix):
+                    actual = entry[len(prefix):].decode(errors="replace")
+                    break
+
+            if actual != expected:
+                raise SystemExit("Running process token is missing or does not match")
+          - "{{ token_env_name.stdout }}"
+          - "{{ agent_state }}"
+          - "{{ agent_config }}"
+          - "{{ agent_service }}"
+      register: process_token_check
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Show recent agent logs
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - -u
+          - "{{ agent_service }}"
+          - --since
+          - "-5 minutes"
+          - --no-pager
+          - -n
+          - "30"
+      register: recent_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Display repair result
+      ansible.builtin.debug:
+        msg:
+          - "Environment token: {{ 'already valid' if env_token_check.rc == 0 else 'restored from state' }}"
+          - "Service status: {{ service_status.stdout | default('unknown') }}"
+          - "Running process token check: {{ 'PASS' if process_token_check.rc == 0 else 'FAIL' }}"
+          - "Recent agent logs:"
+          - "{{ recent_logs.stdout | default('No journal output available') }}"
+
+    - name: Confirm agent service and token are working
+      ansible.builtin.assert:
+        that:
+          - service_status.rc == 0
+          - service_status.stdout == "active"
+          - process_token_check.rc == 0
+        fail_msg: >-
+          Agent verification failed. Review the recent service logs.
+          If the token is absent from the state file, provision a valid token
+          or complete supported enrollment before retrying.
+        success_msg: >-
+          Agent service is active and the running process has the expected token.
