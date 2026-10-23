@@ -3,7 +3,7 @@
   hosts: old, new
   become: true
   gather_facts: false
-  serial: 1
+
 
   vars:
     agent_service: endpoint-agent
