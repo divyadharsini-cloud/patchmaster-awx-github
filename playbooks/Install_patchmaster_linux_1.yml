@@ -1,9 +1,8 @@
 ---
 - name: Install PatchMaster agent on Linux endpoints
-  hosts: TTNJPHGFUN20065
+  hosts: old, new
   become: true
   gather_facts: false
-  serial: 1
 
   vars:
     patchmaster_stage_dir: /tmp/patchmaster-agent-stage
