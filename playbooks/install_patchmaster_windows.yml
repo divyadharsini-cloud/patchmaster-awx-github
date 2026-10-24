@@ -3,7 +3,6 @@
 - name: Install PatchMaster agent on Windows endpoints
   hosts: DCHNVCENRF02, DCHNVCMUDTE0002, DCHNVCPATCO0001, DCHNPHVCMAD0001, DCHNPHVCPAT0002, DCHNVCKORU0001, DCHNVCKORUT0002, DCHNVCMADTEC002, DCHNVCMNLC0002, DCHNVCPUZCO0001, DCHNVCSHOTEC001
   gather_facts: false
-  serial: 1
 
   vars:
     ansible_ssh_transfer_method: scp
