@@ -1,283 +1,134 @@
-
+```yaml
 ---
-- name: Repair and verify PatchMaster Windows Agent Startup
+- name: Repair PatchMaster Windows Agent Startup After Reboot
   hosts: DCHNVCENRF02, DCHNVCMUDTE0002, DCHNVCPATCO0001, DCHNPHVCMAD0001, DCHNPHVCPAT0002, DCHNVCKORU0001, DCHNVCKORUT0002, DCHNVCMADTEC002, DCHNVCMNLC0002, DCHNVCPUZCO0001, DCHNVCSHOTEC001
   gather_facts: false
-  serial: 1
 
   vars:
-    agent_name: EndpointAgentV1
-    agent_root: 'C:\Program Files\EndpointAgent'
-    agent_data: 'C:\ProgramData\EndpointAgent'
+    ansible_connection: ssh
+    ansible_shell_type: powershell
+    ansible_ssh_transfer_method: scp
+    ansible_scp_extra_args: "-O"
+
+    agent_task_name: EndpointAgentV1
     agent_exe: 'C:\Program Files\EndpointAgent\endpoint-agent.exe'
     agent_config: 'C:\ProgramData\EndpointAgent\config.json'
-    agent_state: 'C:\ProgramData\EndpointAgent\state.json'
-    agent_wrapper: 'C:\ProgramData\EndpointAgent\run-agent.ps1'
-    agent_log_dir: 'C:\ProgramData\EndpointAgent\logs'
-    agent_wrapper_log: 'C:\ProgramData\EndpointAgent\logs\agent-wrapper.log'
 
   tasks:
-    - name: Verify required agent files and existing enrollment token
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
 
-          foreach ($file in @(
-            '{{ agent_exe }}',
-            '{{ agent_config }}',
-            '{{ agent_state }}'
-          )) {
-            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-              throw "Required agent file is missing: $file"
+    - name: Repair scheduled task startup and restart behavior
+      ansible.builtin.raw: |
+        $ErrorActionPreference = 'Stop'
+
+        $taskName = '{{ agent_task_name }}'
+        $exe = '{{ agent_exe }}'
+        $config = '{{ agent_config }}'
+
+        Write-Output '--- Checking existing agent files ---'
+
+        if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Agent executable not found: $exe"
+        }
+
+        if (-not (Test-Path -LiteralPath $config)) {
+            throw "Agent configuration not found: $config"
+        }
+
+        Write-Output 'Executable and configuration exist.'
+
+        Write-Output '--- Checking existing scheduled task ---'
+
+        $task = Get-ScheduledTask -TaskName $taskName `
+            -ErrorAction SilentlyContinue
+
+        if ($null -eq $task) {
+            throw "Scheduled task '$taskName' does not exist. No replacement task was created because its original action cannot be verified."
+        }
+
+        if (@($task.Actions).Count -eq 0) {
+            throw 'The existing scheduled task has no action. Repair stopped.'
+        }
+
+        Write-Output 'Existing task action:'
+        $task.Actions | ForEach-Object {
+            Write-Output ("Execute: " + $_.Execute)
+            Write-Output ("Arguments: " + $_.Arguments)
+            Write-Output ("WorkingDirectory: " + $_.WorkingDirectory)
+        }
+
+        Write-Output '--- Ensuring startup trigger ---'
+
+        $triggers = @($task.Triggers)
+
+        $hasStartupTrigger = @(
+            $triggers | Where-Object {
+                $_.CimClass.CimClassName -match 'BootTrigger'
             }
-          }
+        ).Count -gt 0
 
-          $config = Get-Content '{{ agent_config }}' -Raw |
-            ConvertFrom-Json
-          $state = Get-Content '{{ agent_state }}' -Raw |
-            ConvertFrom-Json
+        if (-not $hasStartupTrigger) {
+            $triggers += New-ScheduledTaskTrigger -AtStartup
+            Write-Output 'Added AtStartup trigger.'
+        }
+        else {
+            Write-Output 'AtStartup trigger already exists.'
+        }
 
-          if ([string]::IsNullOrWhiteSpace([string]$config.api_base_url)) {
-            throw 'Agent API URL is missing.'
-          }
+        Write-Output '--- Applying startup repair ---'
 
-          $tokenName = [string]$config.token_env
-          if ([string]::IsNullOrWhiteSpace($tokenName)) {
-            throw 'Agent token_env is missing from the existing configuration.'
-          }
-
-          if ($tokenName -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
-            throw 'Agent token_env is not a valid environment variable name.'
-          }
-
-          if ([string]::IsNullOrWhiteSpace([string]$state.token)) {
-            throw 'Existing endpoint token is missing. Enrollment or token recovery is required.'
-          }
-
-          $Ansible.Result = @{
-            api_url = $config.api_base_url
-            token_present = $true
-            config_valid = $true
-          }
-          $Ansible.Changed = $false
-
-    - name: Ensure agent log directory exists
-      ansible.windows.win_file:
-        path: '{{ agent_log_dir }}'
-        state: directory
-
-    - name: Install persistent agent recovery wrapper
-      ansible.windows.win_copy:
-        dest: '{{ agent_wrapper }}'
-        force: true
-        content: |
-          $ErrorActionPreference = 'Stop'
-
-          $base = 'C:\ProgramData\EndpointAgent'
-          $exe = 'C:\Program Files\EndpointAgent\endpoint-agent.exe'
-          $configPath = "$base\config.json"
-          $statePath = "$base\state.json"
-          $log = "$base\logs\agent-wrapper.log"
-
-          function Write-AgentLog {
-              param([string]$Message)
-              "[$(Get-Date -Format o)] $Message" |
-                  Add-Content -LiteralPath $log
-          }
-
-          Write-AgentLog 'Persistent agent recovery wrapper started.'
-
-          while ($true) {
-              $tokenName = $null
-
-              try {
-                  if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-                      throw "Agent executable missing: $exe"
-                  }
-
-                  $config = Get-Content -LiteralPath $configPath -Raw |
-                      ConvertFrom-Json
-                  $state = Get-Content -LiteralPath $statePath -Raw |
-                      ConvertFrom-Json
-
-                  $tokenName = [string]$config.token_env
-                  $token = [string]$state.token
-
-                  if ($tokenName -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
-                      throw 'Missing or invalid token_env in agent configuration.'
-                  }
-
-                  if ([string]::IsNullOrWhiteSpace($token)) {
-                      throw 'Existing endpoint token is missing.'
-                  }
-
-                  [Environment]::SetEnvironmentVariable(
-                      $tokenName, $token, 'Process'
-                  )
-
-                  Write-AgentLog 'Starting endpoint agent.'
-
-                  & $exe -config $configPath *>> $log
-
-                  $exitCode = $LASTEXITCODE
-                  if ($null -eq $exitCode) {
-                      $exitCode = 1
-                  }
-
-                  Write-AgentLog "Agent exited with code $exitCode."
-              }
-              catch {
-                  Write-AgentLog "Startup error: $($_.Exception.Message)"
-              }
-              finally {
-                  if ($tokenName -match '^[A-Za-z_][A-Za-z0-9_]*$') {
-                      [Environment]::SetEnvironmentVariable(
-                          $tokenName, $null, 'Process'
-                      )
-                  }
-              }
-
-              Write-AgentLog 'Retrying agent startup in 30 seconds.'
-              Start-Sleep -Seconds 30
-          }
-
-    - name: Secure existing agent data directory
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
-
-          & icacls '{{ agent_data }}' /inheritance:r `
-            /grant:r 'SYSTEM:(OI)(CI)F' `
-            'Administrators:(OI)(CI)F'
-
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Failed to secure the agent data directory.'
-          }
-
-          $Ansible.Changed = $false
-
-    - name: Register startup task with recovery settings
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
-
-          $taskName = '{{ agent_name }}'
-          $wrapper = '{{ agent_wrapper }}'
-          $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-
-          $action = New-ScheduledTaskAction `
-            -Execute $powershell `
-            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$wrapper`""
-
-          $trigger = New-ScheduledTaskTrigger -AtStartup
-
-          $principal = New-ScheduledTaskPrincipal `
+        $principal = New-ScheduledTaskPrincipal `
             -UserId 'SYSTEM' `
             -LogonType ServiceAccount `
             -RunLevel Highest
 
-          $settings = New-ScheduledTaskSettingsSet `
+        $settings = New-ScheduledTaskSettingsSet `
             -StartWhenAvailable `
             -RestartCount 3 `
             -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -MultipleInstances IgnoreNew `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries
+            -MultipleInstances IgnoreNew
 
-          Register-ScheduledTask `
+        Set-ScheduledTask `
             -TaskName $taskName `
-            -Action $action `
-            -Trigger $trigger `
+            -Trigger $triggers `
             -Principal $principal `
-            -Settings $settings `
-            -Description 'PatchMaster Windows endpoint agent startup and recovery' `
-            -Force | Out-Null
+            -Settings $settings | Out-Null
 
-          $task = Get-ScheduledTask -TaskName $taskName
-          $actualAction = $task.Actions | Select-Object -First 1
+        Enable-ScheduledTask -TaskName $taskName | Out-Null
 
-          if ($actualAction.Execute -notlike '*powershell.exe') {
-            throw 'Scheduled task executable is incorrect.'
-          }
+        Write-Output '--- Starting agent task ---'
 
-          if ($actualAction.Arguments -notmatch 'run-agent\.ps1') {
-            throw 'Scheduled task is not configured to launch the recovery wrapper.'
-          }
+        Start-ScheduledTask -TaskName $taskName
+        Start-Sleep -Seconds 5
 
-          $Ansible.Changed = $true
+        $repairedTask = Get-ScheduledTask -TaskName $taskName
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
 
-    - name: Start the recovery task
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
+        Write-Output ("Task state: " + $repairedTask.State)
+        Write-Output ("Last run time: " + $taskInfo.LastRunTime)
+        Write-Output ("Last task result: " + $taskInfo.LastTaskResult)
 
-          $taskName = '{{ agent_name }}'
-          $task = Get-ScheduledTask -TaskName $taskName
+        Write-Output '--- Checking agent process ---'
 
-          if ($task.State -ne 'Running') {
-            Start-ScheduledTask -TaskName $taskName
-          }
-
-          Start-Sleep -Seconds 10
-
-          $task = Get-ScheduledTask -TaskName $taskName
-          $info = Get-ScheduledTaskInfo -TaskName $taskName
-
-          $Ansible.Result = @{
-            task_state = [string]$task.State
-            last_run = $info.LastRunTime.ToString()
-            last_result = $info.LastTaskResult
-          }
-
-          if ($task.State -ne 'Running') {
-            throw "Recovery task is not running. State: $($task.State)"
-          }
-
-          $Ansible.Changed = $false
-
-    - name: Verify agent process and recovery task
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
-
-          $taskName = '{{ agent_name }}'
-          $task = Get-ScheduledTask -TaskName $taskName
-          $info = Get-ScheduledTaskInfo -TaskName $taskName
-
-          $process = Get-CimInstance Win32_Process |
+        $processes = Get-CimInstance Win32_Process |
             Where-Object {
-              $_.Name -eq 'endpoint-agent.exe' -and
-              $_.ExecutablePath -eq '{{ agent_exe }}'
-            } |
-            Select-Object -First 1
+                $_.ExecutablePath -eq $exe -or
+                $_.Name -eq 'endpoint-agent.exe'
+            }
 
-          $wrapperProcess = Get-CimInstance Win32_Process |
-            Where-Object {
-              $_.Name -eq 'powershell.exe' -and
-              $_.CommandLine -like '*run-agent.ps1*'
-            } |
-            Select-Object -First 1
+        if ($processes) {
+            $processes | Select-Object ProcessId, Name, ExecutablePath |
+                Format-Table -AutoSize | Out-String | Write-Output
+        }
+        else {
+            Write-Output 'Agent process was not detected yet. Check the agent log and task result.'
+        }
 
-          $Ansible.Result = @{
-            task_state = [string]$task.State
-            last_run = $info.LastRunTime.ToString()
-            last_result = $info.LastTaskResult
-            agent_process_running = ($null -ne $process)
-            wrapper_process_running = ($null -ne $wrapperProcess)
-            wrapper_log = '{{ agent_wrapper_log }}'
-          }
+        Write-Output '--- Repair completed; review verification results above ---'
+      register: agent_repair
+      changed_when: "'Added AtStartup trigger.' in agent_repair.stdout or 'Repair completed' in agent_repair.stdout"
 
-          if ($task.State -ne 'Running') {
-            throw 'Recovery scheduled task is not running.'
-          }
-
-          if ($null -eq $wrapperProcess) {
-            throw 'Recovery wrapper process was not found.'
-          }
-
-          if ($null -eq $process) {
-            throw 'Agent process is not running yet. Inspect agent-wrapper.log and agent.log.'
-          }
-
-          $Ansible.Changed = $false
+    - name: Display repair results
+      ansible.builtin.debug:
+        var: agent_repair.stdout_lines
+```
