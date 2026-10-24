@@ -1,4 +1,3 @@
-```yaml
 ---
 - name: Repair PatchMaster Windows Agent Startup After Reboot
   hosts: DCHNVCENRF02, DCHNVCMUDTE0002, DCHNVCPATCO0001, DCHNPHVCMAD0001, DCHNPHVCPAT0002, DCHNVCKORU0001, DCHNVCKORUT0002, DCHNVCMADTEC002, DCHNVCMNLC0002, DCHNVCPUZCO0001, DCHNVCSHOTEC001
@@ -131,4 +130,4 @@
     - name: Display repair results
       ansible.builtin.debug:
         var: agent_repair.stdout_lines
-```
+
