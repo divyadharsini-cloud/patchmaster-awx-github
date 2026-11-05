@@ -11,30 +11,31 @@
     # patchmaster_api_url
     # patchmaster_bootstrap_token
 
+    # V2 staging directory on the endpoint
     patchmaster_stage_dir: /tmp/patchmaster-agent-v2-stage
 
-    # Expected GitHub checkout structure:
+    # Actual GitHub package location
     patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/linux-v2"
 
-    # Existing V1 installation
+    # V1 installation details
     patchmaster_v1_service: endpoint-agent
     patchmaster_v1_binary: /usr/local/bin/endpoint-agent
     patchmaster_v1_config: /etc/endpoint-agent/config.json
     patchmaster_v1_state: /var/lib/endpoint-agent/state.json
     patchmaster_v1_unit: /etc/systemd/system/endpoint-agent.service
 
-    # New V2 installation
+    # V2 installation details
     patchmaster_v2_service: endpoint-agent-v2
 
-    # Backup location
+    # Backup directory
     patchmaster_backup_dir: >-
       /var/backups/patchmaster-migration-{{ ansible_date_time.iso8601_basic_short }}
 
   tasks:
 
-    # ---------------------------------------------------------
-    # 1. Validate credentials and package
-    # ---------------------------------------------------------
+    # =========================================================
+    # 1. VALIDATE CREDENTIALS
+    # =========================================================
 
     - name: Validate PatchMaster API credentials
       ansible.builtin.assert:
@@ -46,13 +47,17 @@
         fail_msg: "Attach the existing PatchMaster AWX custom credential."
       no_log: true
 
+    # =========================================================
+    # 2. VALIDATE V2 PACKAGE ON AWX
+    # =========================================================
+
     - name: Check V2 Linux package files on AWX execution node
       ansible.builtin.stat:
         path: "{{ item }}"
       loop:
-        - "{{ patchmaster_package_dir }}/dist/endpoint-agent-v2-linux-amd64"
+        - "{{ patchmaster_package_dir }}/endpoint-agent-v2-linux-amd64"
         - "{{ patchmaster_package_dir }}/config.json"
-        - "{{ patchmaster_package_dir }}/deploy/install-linux.sh"
+        - "{{ patchmaster_package_dir }}/install-linux.sh"
       delegate_to: localhost
       become: false
       register: patchmaster_package_checks
@@ -62,12 +67,12 @@
         that:
           - item.stat.exists
           - item.stat.isreg
-        fail_msg: "Required V2 Linux package file is missing."
+        fail_msg: "Required V2 Linux package file is missing from GitHub."
       loop: "{{ patchmaster_package_checks.results }}"
 
-    # ---------------------------------------------------------
-    # 2. Create backup directory
-    # ---------------------------------------------------------
+    # =========================================================
+    # 3. CREATE ENDPOINT BACKUP DIRECTORY
+    # =========================================================
 
     - name: Create migration backup directory
       ansible.builtin.file:
@@ -77,29 +82,33 @@
         group: root
         mode: "0700"
 
-    # ---------------------------------------------------------
-    # 3. Check and back up V1 files
-    # ---------------------------------------------------------
+    # =========================================================
+    # 4. CHECK EXISTING V1 FILES
+    # =========================================================
 
-    - name: Check existing V1 state file
+    - name: Check V1 state file
       ansible.builtin.stat:
         path: "{{ patchmaster_v1_state }}"
       register: patchmaster_v1_state_stat
 
-    - name: Check existing V1 configuration
+    - name: Check V1 configuration
       ansible.builtin.stat:
         path: "{{ patchmaster_v1_config }}"
       register: patchmaster_v1_config_stat
 
-    - name: Check existing V1 binary
+    - name: Check V1 binary
       ansible.builtin.stat:
         path: "{{ patchmaster_v1_binary }}"
       register: patchmaster_v1_binary_stat
 
-    - name: Check existing V1 systemd unit
+    - name: Check V1 systemd unit
       ansible.builtin.stat:
         path: "{{ patchmaster_v1_unit }}"
       register: patchmaster_v1_unit_stat
+
+    # =========================================================
+    # 5. BACKUP EXISTING V1 INSTALLATION
+    # =========================================================
 
     - name: Back up V1 state file
       ansible.builtin.copy:
@@ -141,9 +150,64 @@
         mode: "0644"
       when: patchmaster_v1_unit_stat.stat.exists
 
-    # ---------------------------------------------------------
-    # 4. Stop and disable V1 agent
-    # ---------------------------------------------------------
+    # =========================================================
+    # 6. STAGE V2 PACKAGE BEFORE STOPPING V1
+    # =========================================================
+
+    - name: Create V2 staging directory
+      ansible.builtin.file:
+        path: "{{ patchmaster_stage_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Copy complete V2 Linux package to endpoint
+      ansible.builtin.copy:
+        src: "{{ patchmaster_package_dir }}/"
+        dest: "{{ patchmaster_stage_dir }}/"
+        owner: root
+        group: root
+        mode: preserve
+
+    - name: Set V2 binary executable permission
+      ansible.builtin.file:
+        path: "{{ patchmaster_stage_dir }}/endpoint-agent-v2-linux-amd64"
+        owner: root
+        group: root
+        mode: "0755"
+        state: file
+
+    - name: Verify staged V2 executable
+      ansible.builtin.stat:
+        path: "{{ patchmaster_stage_dir }}/endpoint-agent-v2-linux-amd64"
+      register: patchmaster_staged_binary
+
+    - name: Verify staged V2 configuration
+      ansible.builtin.stat:
+        path: "{{ patchmaster_stage_dir }}/config.json"
+      register: patchmaster_staged_config
+
+    - name: Verify staged V2 installer
+      ansible.builtin.stat:
+        path: "{{ patchmaster_stage_dir }}/install-linux.sh"
+      register: patchmaster_staged_installer
+
+    - name: Validate all staged V2 files
+      ansible.builtin.assert:
+        that:
+          - patchmaster_staged_binary.stat.exists
+          - patchmaster_staged_binary.stat.isreg
+          - patchmaster_staged_binary.stat.executable
+          - patchmaster_staged_config.stat.exists
+          - patchmaster_staged_config.stat.isreg
+          - patchmaster_staged_installer.stat.exists
+          - patchmaster_staged_installer.stat.isreg
+        fail_msg: "V2 package staging or validation failed."
+
+    # =========================================================
+    # 7. STOP AND DISABLE EXISTING V1 AGENT
+    # =========================================================
 
     - name: Stop existing V1 agent
       ansible.builtin.systemd:
@@ -157,25 +221,29 @@
         enabled: false
       failed_when: false
 
-    - name: Remove old V1 systemd unit
-      ansible.builtin.file:
-        path: "{{ patchmaster_v1_unit }}"
-        state: absent
-      when: patchmaster_v1_unit_stat.stat.exists
-
-    - name: Reload systemd after removing V1 unit
+    - name: Reload systemd after disabling V1
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: Remove old V1 binary
-      ansible.builtin.file:
-        path: "{{ patchmaster_v1_binary }}"
-        state: absent
-      when: patchmaster_v1_binary_stat.stat.exists
+    - name: Verify V1 agent is not running
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ patchmaster_v1_service }}"
+      register: patchmaster_v1_stop_check
+      changed_when: false
+      failed_when: false
 
-    # ---------------------------------------------------------
-    # 5. Prepare for fresh V2 enrollment
-    # ---------------------------------------------------------
+    - name: Stop migration if V1 is still running
+      ansible.builtin.assert:
+        that:
+          - patchmaster_v1_stop_check.stdout != "active"
+        fail_msg: "V1 agent is still running. V2 deployment has been stopped."
+
+    # =========================================================
+    # 8. PRESERVE OLD V1 STATE FOR FRESH ENROLLMENT
+    # =========================================================
 
     - name: Move old V1 state out of active location
       ansible.builtin.command:
@@ -185,44 +253,12 @@
           - "{{ patchmaster_backup_dir }}/v1-state-before-reenrollment.json"
       when: patchmaster_v1_state_stat.stat.exists
 
-    # The old state is preserved in the backup directory.
-    # V2 must create its own state during enrollment.
+    # The old state remains in the backup directory.
+    # V2 is expected to create a new endpoint state during enrollment.
 
-    # ---------------------------------------------------------
-    # 6. Stage V2 package
-    # ---------------------------------------------------------
-
-    - name: Create V2 staging directory
-      ansible.builtin.file:
-        path: "{{ patchmaster_stage_dir }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0750"
-
-    - name: Copy V2 Linux package to endpoint
-      ansible.builtin.copy:
-        src: "{{ patchmaster_package_dir }}/"
-        dest: "{{ patchmaster_stage_dir }}/"
-        owner: root
-        group: root
-        mode: preserve
-
-    - name: Verify staged V2 installer
-      ansible.builtin.stat:
-        path: "{{ patchmaster_stage_dir }}/deploy/install-linux.sh"
-      register: patchmaster_staged_installer
-
-    - name: Validate staged installer
-      ansible.builtin.assert:
-        that:
-          - patchmaster_staged_installer.stat.exists
-          - patchmaster_staged_installer.stat.isreg
-        fail_msg: "V2 installer was not staged correctly."
-
-    # ---------------------------------------------------------
-    # 7. Install and enroll V2 using existing bootstrap token
-    # ---------------------------------------------------------
+    # =========================================================
+    # 9. INSTALL AND ENROLL V2 USING EXISTING BOOTSTRAP TOKEN
+    # =========================================================
 
     - name: Install and enroll PatchMaster V2 agent
       ansible.builtin.command:
@@ -230,16 +266,16 @@
           - bash
           - install-linux.sh
       args:
-        chdir: "{{ patchmaster_stage_dir }}/deploy"
+        chdir: "{{ patchmaster_stage_dir }}"
       environment:
         PATCHMASTER_API_URL: "{{ patchmaster_api_url }}"
         PATCHMASTER_BOOTSTRAP_TOKEN: "{{ patchmaster_bootstrap_token }}"
       register: patchmaster_v2_install_result
       no_log: true
 
-    # ---------------------------------------------------------
-    # 8. Reload systemd and start V2
-    # ---------------------------------------------------------
+    # =========================================================
+    # 10. ENABLE AND START V2 AGENT
+    # =========================================================
 
     - name: Reload systemd
       ansible.builtin.systemd:
@@ -251,9 +287,9 @@
         enabled: true
         state: started
 
-    # ---------------------------------------------------------
-    # 9. Verify V1 stopped and V2 running
-    # ---------------------------------------------------------
+    # =========================================================
+    # 11. VERIFY V2 SERVICE
+    # =========================================================
 
     - name: Check V2 service status
       ansible.builtin.command:
@@ -264,27 +300,36 @@
       register: patchmaster_v2_status
       changed_when: false
 
-    - name: Check V1 service status
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - is-active
-          - "{{ patchmaster_v1_service }}"
-      register: patchmaster_v1_status
-      changed_when: false
-      failed_when: false
-
-    - name: Verify V2 is active
+    - name: Verify V2 agent is active
       ansible.builtin.assert:
         that:
           - patchmaster_v2_status.stdout == "active"
-        fail_msg: "V2 agent service is not active. Check its systemd logs."
+        fail_msg: "V2 agent service is not active. Check systemctl logs."
+
+    # =========================================================
+    # 12. VERIFY V1 IS DISABLED
+    # =========================================================
+
+    - name: Check V1 service enabled status
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-enabled
+          - "{{ patchmaster_v1_service }}"
+      register: patchmaster_v1_enabled_status
+      changed_when: false
+      failed_when: false
+
+    # =========================================================
+    # 13. DISPLAY MIGRATION RESULT
+    # =========================================================
 
     - name: Display migration result
       ansible.builtin.debug:
         msg:
           - "Host: {{ inventory_hostname }}"
-          - "V1 service: {{ patchmaster_v1_status.stdout | default('not active') }}"
-          - "V2 service: {{ patchmaster_v2_status.stdout }}"
-          - "Enrollment method: Fresh enrollment using existing bootstrap token"
-          - "V1 backup: {{ patchmaster_backup_dir }}"
+          - "V1 service status: {{ patchmaster_v1_stop_check.stdout }}"
+          - "V1 enabled status: {{ patchmaster_v1_enabled_status.stdout }}"
+          - "V2 service status: {{ patchmaster_v2_status.stdout }}"
+          - "Enrollment: Fresh enrollment using existing bootstrap token"
+          - "V1 backup location: {{ patchmaster_backup_dir }}"
