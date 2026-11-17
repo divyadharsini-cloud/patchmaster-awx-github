@@ -1,0 +1,277 @@
+
+---
+- name: Install PatchMaster agent on Windows endpoints
+  hosts: DPDYPH1FGLA0619
+  gather_facts: false
+
+  vars:
+    ansible_ssh_transfer_method: scp
+    ansible_scp_extra_args: "-O"
+
+    patchmaster_stage_dir: 'C:\PatchMasterAgentStage'
+    patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/windows"
+    patchmaster_install_dir: 'C:\Program Files\EndpointAgent'
+    patchmaster_data_dir: 'C:\ProgramData\EndpointAgent'
+    patchmaster_task_name: 'EndpointAgentV1'
+
+    patchmaster_package_files:
+      - endpoint-agent-v2.3.exe
+      - config.windows.example.json
+      - install-windows.ps1
+
+    patchmaster_source_exe: 'endpoint-agent-v2.3.exe'
+    patchmaster_installed_exe: 'endpoint-agent.exe'
+
+  tasks:
+
+    # 1. Validate AWX credentials
+    - name: Validate PatchMaster credentials
+      ansible.builtin.assert:
+        that:
+          - patchmaster_api_url is defined
+          - patchmaster_api_url | length > 0
+          - patchmaster_bootstrap_token is defined
+          - patchmaster_bootstrap_token | length > 0
+        fail_msg: >-
+          Configure patchmaster_api_url and patchmaster_bootstrap_token
+          using the AWX custom credential.
+      no_log: true
+
+    # 2. Validate source package files
+    - name: Check Windows agent package files
+      ansible.builtin.stat:
+        path: "{{ patchmaster_package_dir }}/{{ item }}"
+      loop: "{{ patchmaster_package_files }}"
+      delegate_to: localhost
+      become: false
+      register: patchmaster_source_files
+
+    - name: Validate source package files
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.size | int > 0
+        fail_msg: "Missing or empty package file: {{ item.item }}"
+      loop: "{{ patchmaster_source_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # 3. Verify Windows SSH
+    - name: Verify Windows SSH command access
+      ansible.windows.win_powershell:
+        script: |
+          [PSCustomObject]@{
+            Hostname = $env:COMPUTERNAME
+            Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          }
+      changed_when: false
+
+    # 4. Create staging directory
+    - name: Create PatchMaster staging directory
+      ansible.windows.win_file:
+        path: "{{ patchmaster_stage_dir }}"
+        state: directory
+
+    # 5. Transfer package files
+    - name: Copy Windows agent package files
+      ansible.windows.win_copy:
+        src: "{{ patchmaster_package_dir }}/{{ item }}"
+        dest: "{{ patchmaster_stage_dir }}\\{{ item }}"
+      loop: "{{ patchmaster_package_files }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # 6. Verify transferred files
+    - name: Verify staged package files
+      ansible.windows.win_stat:
+        path: "{{ patchmaster_stage_dir }}\\{{ item }}"
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop: "{{ patchmaster_package_files }}"
+      register: patchmaster_staged_files
+
+    - name: Validate staged package files
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.size | int > 0
+        fail_msg: "Package transfer failed: {{ item.item }}"
+      loop: "{{ patchmaster_staged_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # 7. Prepare executable filename expected by installer
+    - name: Prepare PatchMaster installer executable
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $stage = '{{ patchmaster_stage_dir }}'
+          $source = Join-Path $stage 'endpoint-agent-v2.3.exe'
+          $target = Join-Path $stage 'endpoint-agent.exe'
+
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Version 2.3 executable missing: $source"
+          }
+
+          Copy-Item -LiteralPath $source -Destination $target -Force
+
+          $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+          $targetHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+
+          if ($sourceHash -ne $targetHash) {
+              throw "Staged executable SHA256 verification failed."
+          }
+
+          [PSCustomObject]@{
+              Source = $source
+              InstallerExecutable = $target
+              SHA256Verified = $true
+          } | ConvertTo-Json -Compress
+
+    # 8. Install and enroll agent
+    - name: Install and configure PatchMaster agent
+      ansible.windows.win_powershell:
+        chdir: "{{ patchmaster_stage_dir }}"
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $env:PATCHMASTER_API_URL = $env:AWX_PATCHMASTER_API_URL
+          $env:PATCHMASTER_BOOTSTRAP_TOKEN = $env:AWX_PATCHMASTER_BOOTSTRAP_TOKEN
+
+          $installer = Join-Path (Get-Location).Path 'install-windows.ps1'
+          $agent = Join-Path (Get-Location).Path 'endpoint-agent.exe'
+          $exampleConfig = Join-Path (Get-Location).Path 'config.windows.example.json'
+
+          foreach ($file in @($installer, $agent, $exampleConfig)) {
+              if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+                  throw "Required package file is missing: $file"
+              }
+          }
+
+          Unblock-File -LiteralPath $installer
+
+          # Execute existing PatchMaster installation script
+          & $installer
+
+          $installedAgent = 'C:\Program Files\EndpointAgent\endpoint-agent.exe'
+          $installedConfig = 'C:\ProgramData\EndpointAgent\config.json'
+
+          if (-not (Test-Path -LiteralPath $installedAgent -PathType Leaf)) {
+              throw "Installed executable missing: $installedAgent"
+          }
+
+          if (-not (Test-Path -LiteralPath $installedConfig -PathType Leaf)) {
+              throw "Agent configuration missing: $installedConfig"
+          }
+
+          # Verify installed executable matches v2.3 package
+          $stagedHash = (Get-FileHash -LiteralPath $agent -Algorithm SHA256).Hash
+          $installedHash = (Get-FileHash -LiteralPath $installedAgent -Algorithm SHA256).Hash
+
+          if ($stagedHash -ne $installedHash) {
+              throw "Installed executable does not match the staged v2.3 package."
+          }
+
+          $task = Get-ScheduledTask -TaskName 'EndpointAgentV1' -ErrorAction Stop
+
+          [PSCustomObject]@{
+              Hostname = $env:COMPUTERNAME
+              TaskName = $task.TaskName
+              TaskState = $task.State.ToString()
+              ExecutablePresent = $true
+              ConfigurationPresent = $true
+              SHA256Verified = $true
+          } | ConvertTo-Json -Compress
+
+      environment:
+        AWX_PATCHMASTER_API_URL: "{{ patchmaster_api_url }}"
+        AWX_PATCHMASTER_BOOTSTRAP_TOKEN: "{{ patchmaster_bootstrap_token }}"
+      register: patchmaster_install_result
+      no_log: true
+
+    # 9. Verify installed executable
+    - name: Verify PatchMaster executable
+      ansible.windows.win_stat:
+        path: "{{ patchmaster_install_dir }}\\{{ patchmaster_installed_exe }}"
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: patchmaster_exe_check
+      changed_when: false
+
+    # 10. Verify configuration
+    - name: Verify PatchMaster configuration file
+      ansible.windows.win_stat:
+        path: "{{ patchmaster_data_dir }}\\config.json"
+      register: patchmaster_config_check
+      changed_when: false
+
+    # 11. Verify scheduled task and process
+    - name: Verify PatchMaster scheduled task and running process
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $taskName = 'EndpointAgentV1'
+          $expectedExe = 'C:\Program Files\EndpointAgent\endpoint-agent.exe'
+
+          $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+
+          $action = $task.Actions | Select-Object -First 1
+
+          if ($action.Execute -ne $expectedExe) {
+              throw "Scheduled task executable path is incorrect."
+          }
+
+          $process = Get-CimInstance Win32_Process |
+              Where-Object {
+                  $_.ExecutablePath -eq $expectedExe
+              } |
+              Select-Object -First 1
+
+          if (-not $process) {
+              throw "PatchMaster agent process is not running."
+          }
+
+          [PSCustomObject]@{
+              Hostname = $env:COMPUTERNAME
+              TaskName = $task.TaskName
+              TaskState = $task.State.ToString()
+              LastTaskResult = (Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult
+              ProcessId = $process.ProcessId
+              ProcessRunning = $true
+              ActionPathCorrect = $true
+          } | ConvertTo-Json -Compress
+
+      register: patchmaster_task_check
+      changed_when: false
+
+    # 12. Final installation assertion
+    - name: Confirm PatchMaster installation
+      ansible.builtin.assert:
+        that:
+          - patchmaster_exe_check.stat.exists
+          - patchmaster_exe_check.stat.size | int > 0
+          - patchmaster_config_check.stat.exists
+          - patchmaster_task_check is succeeded
+          - patchmaster_install_result is succeeded
+        fail_msg: >-
+          PatchMaster installation verification failed.
+          Check executable, configuration, scheduled task and agent process.
+        success_msg: >-
+          PatchMaster v2.3 executable, configuration, scheduled task
+          and running agent process verified successfully.
+
+    # 13. Report installation result
+    - name: Report PatchMaster installation result
+      ansible.builtin.debug:
+        msg:
+          - "Target host: {{ inventory_hostname }}"
+          - "Installation directory: {{ patchmaster_install_dir }}"
+          - "Executable: {{ patchmaster_installed_exe }}"
+          - "Scheduled task: {{ patchmaster_task_name }}"
+          - "Installation verification: successful"
+          - "Agent process: running"
+          - "Dashboard enrollment: verify latest API heartbeat separately."
