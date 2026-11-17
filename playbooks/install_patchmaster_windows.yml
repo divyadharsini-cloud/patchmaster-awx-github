@@ -16,7 +16,7 @@
     patchmaster_task_name: 'EndpointAgentV1'
 
     patchmaster_package_files:
-      - endpoint-agent.exe
+      - endpoint-agent-v2.3.exe
       - config.windows.example.json
       - install-windows.ps1
 
@@ -112,7 +112,7 @@
           $env:PATCHMASTER_BOOTSTRAP_TOKEN = $env:AWX_PATCHMASTER_BOOTSTRAP_TOKEN
 
           $installer = Join-Path (Get-Location).Path 'install-windows.ps1'
-          $agent = Join-Path (Get-Location).Path 'endpoint-agent.exe'
+          $agent = Join-Path (Get-Location).Path 'endpoint-agent-v2.3.exe'
           $exampleConfig = Join-Path (Get-Location).Path 'config.windows.example.json'
 
           foreach ($file in @($installer, $agent, $exampleConfig)) {
@@ -129,7 +129,7 @@
               -TaskName 'EndpointAgentV1' `
               -ErrorAction Stop
 
-          $installedAgent = 'C:\Program Files\EndpointAgent\endpoint-agent.exe'
+          $installedAgent = 'C:\Program Files\EndpointAgent\endpoint-agent-v2.3.exe'
           $installedConfig = 'C:\ProgramData\EndpointAgent\config.json'
 
           if (-not (Test-Path -LiteralPath $installedAgent -PathType Leaf)) {
@@ -171,7 +171,7 @@
     # 9. Verify installed executable
     - name: Verify PatchMaster executable
       ansible.windows.win_stat:
-        path: "{{ patchmaster_install_dir }}\\endpoint-agent.exe"
+        path: "{{ patchmaster_install_dir }}\\endpoint-agent-v2.3.exe"
       register: patchmaster_exe_check
       changed_when: false
 
