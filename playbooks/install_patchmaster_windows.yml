@@ -1,7 +1,7 @@
 
 ---
 - name: Install PatchMaster agent on Windows endpoints
-  hosts: LMDULB3FAIT0019
+  hosts: DPDYPH1FGLA0619
 
   gather_facts: false
 
