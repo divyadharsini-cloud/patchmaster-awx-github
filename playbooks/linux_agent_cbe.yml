@@ -4,7 +4,6 @@
   become: true
   gather_facts: false
 
-
   vars:
     patchmaster_stage_dir: /tmp/patchmaster-agent-stage
     patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/linux-v2"
@@ -41,7 +40,7 @@
 
     - name: Copy Linux configuration template
       ansible.builtin.copy:
-        src: "{{ patchmaster_package_dir }}/config.linux.example.json"
+        src: "{{ patchmaster_package_dir }}/config.json"
         dest: "{{ patchmaster_stage_dir }}/config.linux.example.json"
         owner: root
         group: root
