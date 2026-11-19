@@ -1,6 +1,6 @@
 
 ---
-- name: Deploy and Enroll PatchMaster Linux Agents
+- name: Deploy and Enroll PatchMaster Linux Agent
   hosts: DPDYPH1FCMP0049
   become: true
   gather_facts: false
@@ -8,8 +8,6 @@
   vars:
     patchmaster_stage_dir: /tmp/patchmaster-agent-stage
     patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/linux-v2"
-    patchmaster_api_host: "172.17.6.142"
-    patchmaster_api_port: 5000
 
   tasks:
 
@@ -22,14 +20,12 @@
           - patchmaster_api_url | length > 0
           - patchmaster_bootstrap_token is defined
           - patchmaster_bootstrap_token | length == 44
-        fail_msg: >-
-          PatchMaster API URL or bootstrap credential is missing.
-          Expected bootstrap token length is 44.
+        fail_msg: "Invalid PatchMaster AWX credentials."
       no_log: true
 
     # 2. Validate package files on AWX controller
 
-    - name: Check PatchMaster package files
+    - name: Check Linux v2.3 package
       ansible.builtin.stat:
         path: "{{ patchmaster_package_dir }}/{{ item }}"
       delegate_to: localhost
@@ -38,24 +34,47 @@
         - endpoint-agent-v2.3-standard-linux-amd64
         - config.linux.example.json
         - install-linux.sh
-        - deploy/endpoint-agent.service
-      register: patchmaster_package_validation
+      register: patchmaster_package_files
 
-    - name: Validate PatchMaster package
+    - name: Validate Linux v2.3 package
       ansible.builtin.assert:
         that:
           - item.stat.exists
           - item.stat.isreg
           - item.stat.size > 0
+        fail_msg: "Missing package file: {{ item.item }}"
+      loop: "{{ patchmaster_package_files.results }}"
+
+    # 3. Locate existing systemd service on endpoint
+
+    - name: Locate existing PatchMaster service
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - --property=FragmentPath
+          - --value
+          - endpoint-agent
+      register: patchmaster_service_file
+      changed_when: false
+
+    - name: Verify existing service file
+      ansible.builtin.stat:
+        path: "{{ patchmaster_service_file.stdout }}"
+      register: patchmaster_existing_service
+
+    - name: Require existing service file
+      ansible.builtin.assert:
+        that:
+          - patchmaster_existing_service.stat.exists
+          - patchmaster_existing_service.stat.isreg
         fail_msg: >-
-          Missing or empty package file:
-          {{ item.item }}
-          Expected directory: {{ patchmaster_package_dir }}
-      loop: "{{ patchmaster_package_validation.results }}"
+          Existing endpoint-agent systemd service was not found.
+          No replacement service will be invented.
 
-    # 3. Create staging directories
+    # 4. Create staging directories
 
-    - name: Create PatchMaster staging directories
+    - name: Create staging directories
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
@@ -66,17 +85,17 @@
         - "{{ patchmaster_stage_dir }}"
         - "{{ patchmaster_stage_dir }}/deploy"
 
-    # 4. Copy Linux agent binary
+    # 5. Copy v2.3 binary using original installer filename
 
-    - name: Copy Linux agent binary
+    - name: Copy PatchMaster v2.3 binary
       ansible.builtin.copy:
         src: "{{ patchmaster_package_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
-        dest: "{{ patchmaster_stage_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
+        dest: "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
         owner: root
         group: root
         mode: "0755"
 
-    # 5. Copy configuration template
+    # 6. Copy configuration template
 
     - name: Copy Linux configuration template
       ansible.builtin.copy:
@@ -86,9 +105,9 @@
         group: root
         mode: "0644"
 
-    # 6. Copy original installer
+    # 7. Copy original installer
 
-    - name: Copy original Linux installer
+    - name: Copy original installer
       ansible.builtin.copy:
         src: "{{ patchmaster_package_dir }}/install-linux.sh"
         dest: "{{ patchmaster_stage_dir }}/install-linux.sh"
@@ -96,47 +115,48 @@
         group: root
         mode: "0750"
 
-    # 7. Copy original systemd service
+    # 8. Reuse existing endpoint service definition
 
-    - name: Copy PatchMaster systemd service
+    - name: Copy existing systemd service into staging
       ansible.builtin.copy:
-        src: "{{ patchmaster_package_dir }}/deploy/endpoint-agent.service"
+        src: "{{ patchmaster_service_file.stdout }}"
         dest: "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
+        remote_src: true
         owner: root
         group: root
         mode: "0644"
 
-    # 8. Verify staged files
+    # 9. Verify staged binary and service
 
-    - name: Verify staged installation files
+    - name: Verify staged files
       ansible.builtin.stat:
         path: "{{ item }}"
       loop:
-        - "{{ patchmaster_stage_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
+        - "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
         - "{{ patchmaster_stage_dir }}/config.linux.example.json"
         - "{{ patchmaster_stage_dir }}/install-linux.sh"
         - "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
-      register: patchmaster_staged_files
+      register: patchmaster_staged
 
-    - name: Validate staged installation files
+    - name: Validate staged files
       ansible.builtin.assert:
         that:
           - item.stat.exists
           - item.stat.isreg
           - item.stat.size > 0
-        fail_msg: "Staged PatchMaster installation file is missing."
-      loop: "{{ patchmaster_staged_files.results }}"
+        fail_msg: "Staging failed for a required PatchMaster file."
+      loop: "{{ patchmaster_staged.results }}"
 
-    # 9. Check API connectivity before installation
+    # 10. Check API connectivity
 
-    - name: Check PatchMaster API connectivity
+    - name: Check PatchMaster API
       ansible.builtin.wait_for:
-        host: "{{ patchmaster_api_host }}"
-        port: "{{ patchmaster_api_port }}"
+        host: 172.17.6.142
+        port: 5000
         timeout: 10
         state: started
 
-    # 10. Execute original installer
+    # 11. Run original installer
 
     - name: Install and enroll PatchMaster agent
       ansible.builtin.command:
@@ -146,84 +166,76 @@
       environment:
         PATCHMASTER_API_URL: "{{ patchmaster_api_url }}"
         PATCHMASTER_BOOTSTRAP_TOKEN: "{{ patchmaster_bootstrap_token }}"
-      register: patchmaster_install_result
+      register: patchmaster_install
       no_log: true
 
-    # 11. Verify installed configuration against AWX credential
+    # 12. Verify installed configuration without exposing token
 
-    - name: Verify installed bootstrap credential
+    - name: Verify installed configuration
       ansible.builtin.command:
         argv:
           - python3
           - -c
           - |
-            import json
-            import os
-            import sys
+            import json, os, sys
 
-            path = "/etc/endpoint-agent/config.json"
-
-            with open(path, encoding="utf-8") as f:
+            with open("/etc/endpoint-agent/config.json") as f:
                 config = json.load(f)
 
-            expected = os.environ["EXPECTED_BOOTSTRAP_TOKEN"]
+            expected = os.environ["EXPECTED_TOKEN"]
             actual = config.get("bootstrap_token", "")
 
             if actual != expected:
                 print("TOKEN_MISMATCH")
                 sys.exit(1)
 
-            if config.get("api_base_url") != os.environ["EXPECTED_API_URL"]:
+            if config.get("api_base_url") != os.environ["EXPECTED_API"]:
                 print("API_URL_MISMATCH")
                 sys.exit(1)
 
             print("CONFIG_MATCH")
       environment:
-        EXPECTED_BOOTSTRAP_TOKEN: "{{ patchmaster_bootstrap_token }}"
-        EXPECTED_API_URL: "{{ patchmaster_api_url }}"
-      register: patchmaster_config_check
+        EXPECTED_TOKEN: "{{ patchmaster_bootstrap_token }}"
+        EXPECTED_API: "{{ patchmaster_api_url }}"
+      register: patchmaster_config
       changed_when: false
       no_log: true
 
-    - name: Validate installed configuration
+    - name: Validate configuration
       ansible.builtin.assert:
         that:
-          - patchmaster_config_check.rc == 0
-        fail_msg: >-
-          Installed configuration does not match AWX credentials.
-          Check installer and credential delivery.
+          - patchmaster_config.rc == 0
+        fail_msg: "Endpoint configuration does not match AWX credentials."
 
-    # 12. Reload systemd
+    # 13. Reload and start service
 
     - name: Reload systemd
       ansible.builtin.systemd_service:
         daemon_reload: true
 
-    # 13. Enable and start agent
-
-    - name: Enable and start PatchMaster agent
+    - name: Enable and start agent
       ansible.builtin.systemd_service:
         name: endpoint-agent
         enabled: true
-        state: started
+        state: restarted
 
-    # 14. Wait for agent service
+    # 14. Verify service
 
-    - name: Wait for PatchMaster agent service
+    - name: Wait for active service
       ansible.builtin.command:
         argv:
           - systemctl
           - is-active
           - endpoint-agent
-      register: patchmaster_service
+      register: patchmaster_active
       changed_when: false
       retries: 12
       delay: 5
-      until: patchmaster_service.rc == 0
+      until: patchmaster_active.rc == 0
 
-    # 15. Get agent version
+    # 15. Get installed version
 
-    - name: Get PatchMaster agent version
+    - name: Get PatchMaster version
       ansible.builtin.command:
         argv:
           - /usr/local/bin/endpoint-agent
@@ -232,23 +244,9 @@
       changed_when: false
       failed_when: false
 
-    # 16. Collect service status
+    # 16. Collect enrollment logs
 
-    - name: Get PatchMaster service status
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - status
-          - endpoint-agent
-          - --no-pager
-          - -l
-      register: patchmaster_status
-      changed_when: false
-      failed_when: false
-
-    # 17. Collect recent logs
-
-    - name: Get recent PatchMaster agent logs
+    - name: Get recent PatchMaster logs
       ansible.builtin.command:
         argv:
           - journalctl
@@ -261,37 +259,25 @@
       changed_when: false
       failed_when: false
 
-    # 18. Final deployment report
+    # 17. Deployment report
 
     - name: Display PatchMaster deployment report
       ansible.builtin.debug:
         msg:
-          - "========================================"
-          - "PATCHMASTER LINUX DEPLOYMENT REPORT"
-          - "========================================"
           - "Endpoint: {{ inventory_hostname }}"
           - "Installer: SUCCESS"
           - "Configuration: MATCH"
           - "Agent Version: {{ patchmaster_version.stdout | default('Unavailable') }}"
-          - "Service State: {{ patchmaster_service.stdout | default('unknown') }}"
-          - "========================================"
-          - "SERVICE STATUS"
-          - "{{ patchmaster_status.stdout | default('Unavailable') }}"
-          - "========================================"
-          - "RECENT AGENT LOGS"
-          - "{{ patchmaster_logs.stdout | default('No logs available') }}"
+          - "Service: {{ patchmaster_active.stdout }}"
+          - "Recent logs:"
+          - "{{ patchmaster_logs.stdout | default('Unavailable') }}"
 
-    # 19. Final validation
+    # 18. Final validation
 
-    - name: Validate PatchMaster deployment
+    - name: Validate deployment
       ansible.builtin.assert:
         that:
-          - patchmaster_install_result.rc == 0
-          - patchmaster_config_check.rc == 0
-          - patchmaster_service.rc == 0
-        success_msg: >-
-          PatchMaster agent installation and service validation
-          succeeded on {{ inventory_hostname }}.
-        fail_msg: >-
-          PatchMaster deployment validation failed on
-          {{ inventory_hostname }}. Review the service logs.
+          - patchmaster_install.rc == 0
+          - patchmaster_config.rc == 0
+          - patchmaster_active.rc == 0
+        success_msg: "PatchMaster deployment completed successfully."
