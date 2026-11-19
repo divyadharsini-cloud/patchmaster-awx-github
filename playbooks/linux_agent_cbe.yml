@@ -7,7 +7,7 @@
 
   vars:
     patchmaster_stage_dir: /tmp/patchmaster-agent-stage
-    patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/linux"
+    patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/linux-v2"
 
   tasks:
     - name: Validate PatchMaster credentials
