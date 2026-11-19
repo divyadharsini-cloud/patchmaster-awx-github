@@ -33,8 +33,8 @@
 
     - name: Copy Linux agent binary
       ansible.builtin.copy:
-        src: "{{ patchmaster_package_dir }}/endpoint-agent-linux-amd64"
-        dest: "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
+        src: "{{ patchmaster_package_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
+        dest: "{{ patchmaster_stage_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
         owner: root
         group: root
         mode: "0755"
@@ -82,7 +82,7 @@
       ansible.builtin.stat:
         path: "{{ item }}"
       loop:
-        - "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
+        - "{{ patchmaster_stage_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
         - "{{ patchmaster_stage_dir }}/config.linux.example.json"
         - "{{ patchmaster_stage_dir }}/install-linux.sh"
         - "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
