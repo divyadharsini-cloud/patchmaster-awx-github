@@ -1,7 +1,7 @@
 
 ---
 - name: Migrate and recover PatchMaster Linux Agent V2
-  hosts: ansibletesting
+  hosts: DPDYPH1FCMP0049
   become: true
   gather_facts: true
   serial: 1
