@@ -79,7 +79,7 @@
       ansible.builtin.stat:
         path: "{{ item }}"
       loop:
-        - "{{ patchmaster_package_dir }}/endpoint-agent-v2-linux-amd64"
+        - "{{ patchmaster_package_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
         - "{{ patchmaster_package_dir }}/config.json"
         - "{{ patchmaster_package_dir }}/install-linux.sh"
       delegate_to: localhost
@@ -223,8 +223,8 @@
 
     - name: Copy V2 binary into expected dist directory
       ansible.builtin.copy:
-        src: "{{ patchmaster_stage_dir }}/endpoint-agent-v2-linux-amd64"
-        dest: "{{ patchmaster_stage_dir }}/dist/endpoint-agent-v2-linux-amd64"
+        src: "{{ patchmaster_stage_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
+        dest: "{{ patchmaster_stage_dir }}/dist/endpoint-agent-v2.3-standard-linux-amd64"
         remote_src: true
         owner: root
         group: root
@@ -236,7 +236,7 @@
 
     - name: Check staged V2 executable
       ansible.builtin.stat:
-        path: "{{ patchmaster_stage_dir }}/dist/endpoint-agent-v2-linux-amd64"
+        path: "{{ patchmaster_stage_dir }}/dist/endpoint-agent-v2.3-standard-linux-amd64"
       register: patchmaster_staged_binary
 
     - name: Check staged V2 configuration
