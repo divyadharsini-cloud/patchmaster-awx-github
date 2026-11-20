@@ -1,17 +1,28 @@
 
 ---
-- name: Deploy and Enroll PatchMaster Linux Agent
+- name: Deploy or Upgrade PatchMaster Linux Agent v2.3
   hosts: DPDYPHGFPCD0548
   become: true
   gather_facts: false
+  serial: 1
 
   vars:
     patchmaster_stage_dir: /tmp/patchmaster-agent-stage
     patchmaster_package_dir: "{{ playbook_dir }}/../files/patchmaster-agent/linux-v2"
 
+    patchmaster_binary: /usr/local/bin/endpoint-agent
+    patchmaster_config: /etc/endpoint-agent/config.json
+    patchmaster_state: /var/lib/endpoint-agent/state.json
+    patchmaster_service: endpoint-agent
+
+    patchmaster_api_host: 172.17.6.142
+    patchmaster_api_port: 5000
+
   tasks:
 
-    # 1. Validate AWX credentials
+    # ==========================================================
+    # 1. VALIDATE AWX CREDENTIALS
+    # ==========================================================
 
     - name: Validate PatchMaster credentials
       ansible.builtin.assert:
@@ -23,9 +34,12 @@
         fail_msg: "Invalid PatchMaster AWX credentials."
       no_log: true
 
-    # 2. Validate package files on AWX controller
 
-    - name: Check Linux v2.3 package
+    # ==========================================================
+    # 2. VALIDATE PACKAGE FILES ON AWX CONTROLLER
+    # ==========================================================
+
+    - name: Check PatchMaster v2.3 package
       ansible.builtin.stat:
         path: "{{ patchmaster_package_dir }}/{{ item }}"
       delegate_to: localhost
@@ -34,45 +48,132 @@
         - endpoint-agent-v2.3-standard-linux-amd64
         - config.linux.example.json
         - install-linux.sh
+        - deploy/endpoint-agent.service
       register: patchmaster_package_files
 
-    - name: Validate Linux v2.3 package
+    - name: Validate PatchMaster package
       ansible.builtin.assert:
         that:
           - item.stat.exists
           - item.stat.isreg
           - item.stat.size > 0
-        fail_msg: "Missing package file: {{ item.item }}"
+        fail_msg: "Missing or empty package file: {{ item.item }}"
       loop: "{{ patchmaster_package_files.results }}"
 
-    # 3. Locate existing systemd service on endpoint
 
-    - name: Locate existing PatchMaster service
+    # ==========================================================
+    # 3. DETECT EXISTING AGENT
+    # ==========================================================
+
+    - name: Check existing agent binary
+      ansible.builtin.stat:
+        path: "{{ patchmaster_binary }}"
+      register: patchmaster_binary_check
+
+    - name: Check existing configuration
+      ansible.builtin.stat:
+        path: "{{ patchmaster_config }}"
+      register: patchmaster_config_check
+
+    - name: Check existing agent state
+      ansible.builtin.stat:
+        path: "{{ patchmaster_state }}"
+      register: patchmaster_state_check
+
+    - name: Detect existing systemd service
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - --property=LoadState
+          - --value
+          - "{{ patchmaster_service }}"
+      register: patchmaster_service_load
+      changed_when: false
+      failed_when: false
+
+    - name: Locate existing service definition
       ansible.builtin.command:
         argv:
           - systemctl
           - show
           - --property=FragmentPath
           - --value
-          - endpoint-agent
-      register: patchmaster_service_file
+          - "{{ patchmaster_service }}"
+      register: patchmaster_service_path
       changed_when: false
+      failed_when: false
 
-    - name: Verify existing service file
+    - name: Check existing service file
       ansible.builtin.stat:
-        path: "{{ patchmaster_service_file.stdout }}"
-      register: patchmaster_existing_service
+        path: "{{ patchmaster_service_path.stdout | trim }}"
+      register: patchmaster_service_file_check
+      when:
+        - patchmaster_service_load.stdout | trim == 'loaded'
+        - patchmaster_service_path.stdout | trim | length > 0
 
-    - name: Require existing service file
+    - name: Set installation detection facts
+      ansible.builtin.set_fact:
+        patchmaster_has_binary: "{{ patchmaster_binary_check.stat.exists }}"
+        patchmaster_has_config: "{{ patchmaster_config_check.stat.exists }}"
+        patchmaster_has_state: "{{ patchmaster_state_check.stat.exists }}"
+        patchmaster_has_service: "{{ patchmaster_service_load.stdout | trim == 'loaded' }}"
+        patchmaster_has_service_file: >-
+          {{
+            patchmaster_service_file_check.stat.exists
+            if patchmaster_service_file_check is not skipped
+            else false
+          }}
+
+    - name: Determine whether agent is installed
+      ansible.builtin.set_fact:
+        patchmaster_any_existing: >-
+          {{
+            patchmaster_has_binary
+            or patchmaster_has_config
+            or patchmaster_has_state
+            or patchmaster_has_service
+          }}
+
+        patchmaster_existing_install: >-
+          {{
+            patchmaster_has_binary
+            and patchmaster_has_config
+            and patchmaster_has_service
+            and patchmaster_has_service_file
+          }}
+
+    - name: Display detected installation mode
+      ansible.builtin.debug:
+        msg:
+          - "Endpoint: {{ inventory_hostname }}"
+          - "Binary detected: {{ patchmaster_has_binary }}"
+          - "Configuration detected: {{ patchmaster_has_config }}"
+          - "State detected: {{ patchmaster_has_state }}"
+          - "Service detected: {{ patchmaster_has_service }}"
+          - >-
+            Mode:
+            {{
+              'UPGRADE'
+              if patchmaster_existing_install
+              else 'FRESH INSTALL'
+              if not patchmaster_any_existing
+              else 'INCOMPLETE INSTALLATION'
+            }}
+
+    - name: Stop if an incomplete installation is detected
       ansible.builtin.assert:
         that:
-          - patchmaster_existing_service.stat.exists
-          - patchmaster_existing_service.stat.isreg
+          - patchmaster_existing_install or not patchmaster_any_existing
         fail_msg: >-
-          Existing endpoint-agent systemd service was not found.
-          No replacement service will be invented.
+          Partial PatchMaster installation detected.
+          Automatic installation stopped to protect existing files and state.
+          Please inspect the endpoint before proceeding.
 
-    # 4. Create staging directories
+
+    # ==========================================================
+    # 4. CREATE STAGING DIRECTORIES
+    # ==========================================================
 
     - name: Create staging directories
       ansible.builtin.file:
@@ -85,9 +186,12 @@
         - "{{ patchmaster_stage_dir }}"
         - "{{ patchmaster_stage_dir }}/deploy"
 
-    # 5. Copy v2.3 binary using original installer filename
 
-    - name: Copy PatchMaster v2.3 binary
+    # ==========================================================
+    # 5. STAGE V2.3 BINARY
+    # ==========================================================
+
+    - name: Copy v2.3 binary to staging
       ansible.builtin.copy:
         src: "{{ patchmaster_package_dir }}/endpoint-agent-v2.3-standard-linux-amd64"
         dest: "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
@@ -95,9 +199,12 @@
         group: root
         mode: "0755"
 
-    # 6. Copy configuration template
 
-    - name: Copy Linux configuration template
+    # ==========================================================
+    # 6. STAGE CONFIGURATION TEMPLATE
+    # ==========================================================
+
+    - name: Copy configuration template
       ansible.builtin.copy:
         src: "{{ patchmaster_package_dir }}/config.linux.example.json"
         dest: "{{ patchmaster_stage_dir }}/config.linux.example.json"
@@ -105,9 +212,12 @@
         group: root
         mode: "0644"
 
-    # 7. Copy original installer
 
-    - name: Copy original installer
+    # ==========================================================
+    # 7. STAGE INSTALLER
+    # ==========================================================
+
+    - name: Copy installer
       ansible.builtin.copy:
         src: "{{ patchmaster_package_dir }}/install-linux.sh"
         dest: "{{ patchmaster_stage_dir }}/install-linux.sh"
@@ -115,18 +225,24 @@
         group: root
         mode: "0750"
 
-    # 8. Reuse existing endpoint service definition
 
-    - name: Copy existing systemd service into staging
+    # ==========================================================
+    # 8. STAGE SERVICE FILE FOR FRESH INSTALLATION
+    # ==========================================================
+
+    - name: Copy service definition for fresh installation
       ansible.builtin.copy:
-        src: "{{ patchmaster_service_file.stdout }}"
+        src: "{{ patchmaster_package_dir }}/deploy/endpoint-agent.service"
         dest: "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
-        remote_src: true
         owner: root
         group: root
         mode: "0644"
+      when: not patchmaster_existing_install
 
-    # 9. Verify staged binary and service
+
+    # ==========================================================
+    # 9. VERIFY STAGING
+    # ==========================================================
 
     - name: Verify staged files
       ansible.builtin.stat:
@@ -135,8 +251,7 @@
         - "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
         - "{{ patchmaster_stage_dir }}/config.linux.example.json"
         - "{{ patchmaster_stage_dir }}/install-linux.sh"
-        - "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
-      register: patchmaster_staged
+      register: patchmaster_staged_files
 
     - name: Validate staged files
       ansible.builtin.assert:
@@ -144,21 +259,42 @@
           - item.stat.exists
           - item.stat.isreg
           - item.stat.size > 0
-        fail_msg: "Staging failed for a required PatchMaster file."
-      loop: "{{ patchmaster_staged.results }}"
+        fail_msg: "Staged PatchMaster file is missing."
+      loop: "{{ patchmaster_staged_files.results }}"
 
-    # 10. Check API connectivity
+    - name: Verify fresh installation service file
+      ansible.builtin.stat:
+        path: "{{ patchmaster_stage_dir }}/deploy/endpoint-agent.service"
+      register: patchmaster_staged_service
+      when: not patchmaster_existing_install
+
+    - name: Validate fresh installation service file
+      ansible.builtin.assert:
+        that:
+          - patchmaster_staged_service.stat.exists
+          - patchmaster_staged_service.stat.isreg
+          - patchmaster_staged_service.stat.size > 0
+        fail_msg: "Fresh installation service file is missing."
+      when: not patchmaster_existing_install
+
+
+    # ==========================================================
+    # 10. CHECK API CONNECTIVITY
+    # ==========================================================
 
     - name: Check PatchMaster API
       ansible.builtin.wait_for:
-        host: 172.17.6.142
-        port: 5000
-        timeout: 10
+        host: "{{ patchmaster_api_host }}"
+        port: "{{ patchmaster_api_port }}"
+        timeout: 15
         state: started
 
-    # 11. Run original installer
 
-    - name: Install and enroll PatchMaster agent
+    # ==========================================================
+    # 11. FRESH INSTALLATION
+    # ==========================================================
+
+    - name: Fresh install PatchMaster agent
       ansible.builtin.command:
         argv:
           - ./install-linux.sh
@@ -166,92 +302,133 @@
       environment:
         PATCHMASTER_API_URL: "{{ patchmaster_api_url }}"
         PATCHMASTER_BOOTSTRAP_TOKEN: "{{ patchmaster_bootstrap_token }}"
-      register: patchmaster_install
+      register: patchmaster_fresh_install
       no_log: true
+      when: not patchmaster_existing_install
 
-    # 12. Verify installed configuration without exposing token
 
-    - name: Verify installed configuration
-      ansible.builtin.command:
-        argv:
-          - python3
-          - -c
-          - |
-            import json, os, sys
+    # ==========================================================
+    # 12. UPGRADE EXISTING AGENT
+    # ==========================================================
 
-            with open("/etc/endpoint-agent/config.json") as f:
-                config = json.load(f)
+    - name: Stop existing agent before upgrade
+      ansible.builtin.systemd_service:
+        name: "{{ patchmaster_service }}"
+        state: stopped
+      when: patchmaster_existing_install
 
-            expected = os.environ["EXPECTED_TOKEN"]
-            actual = config.get("bootstrap_token", "")
+    - name: Backup existing agent binary
+      ansible.builtin.copy:
+        src: "{{ patchmaster_binary }}"
+        dest: "{{ patchmaster_binary }}.pre-v2.3"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when: patchmaster_existing_install
 
-            if actual != expected:
-                print("TOKEN_MISMATCH")
-                sys.exit(1)
+    - name: Upgrade existing agent binary to v2.3
+      ansible.builtin.copy:
+        src: "{{ patchmaster_stage_dir }}/endpoint-agent-linux-amd64"
+        dest: "{{ patchmaster_binary }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when: patchmaster_existing_install
 
-            if config.get("api_base_url") != os.environ["EXPECTED_API"]:
-                print("API_URL_MISMATCH")
-                sys.exit(1)
+    - name: Confirm existing configuration is preserved
+      ansible.builtin.stat:
+        path: "{{ patchmaster_config }}"
+      register: patchmaster_config_after_upgrade
+      when: patchmaster_existing_install
 
-            print("CONFIG_MATCH")
-      environment:
-        EXPECTED_TOKEN: "{{ patchmaster_bootstrap_token }}"
-        EXPECTED_API: "{{ patchmaster_api_url }}"
-      register: patchmaster_config
-      changed_when: false
-      no_log: true
+    - name: Confirm existing enrollment state is preserved
+      ansible.builtin.stat:
+        path: "{{ patchmaster_state }}"
+      register: patchmaster_state_after_upgrade
+      when:
+        - patchmaster_existing_install
+        - patchmaster_state_check.stat.exists
 
-    - name: Validate configuration
+    - name: Validate preserved configuration
       ansible.builtin.assert:
         that:
-          - patchmaster_config.rc == 0
-        fail_msg: "Endpoint configuration does not match AWX credentials."
+          - patchmaster_config_after_upgrade.stat.exists
+        fail_msg: "Existing agent configuration was not preserved."
+      when: patchmaster_existing_install
 
-    # 13. Reload and start service
+    - name: Validate preserved enrollment state
+      ansible.builtin.assert:
+        that:
+          - patchmaster_state_after_upgrade.stat.exists
+        fail_msg: "Existing agent enrollment state was not preserved."
+      when:
+        - patchmaster_existing_install
+        - patchmaster_state_check.stat.exists
+
+
+    # ==========================================================
+    # 13. RELOAD SYSTEMD
+    # ==========================================================
 
     - name: Reload systemd
       ansible.builtin.systemd_service:
         daemon_reload: true
 
-    - name: Enable and start agent
+
+    # ==========================================================
+    # 14. ENABLE AND START AGENT
+    # ==========================================================
+
+    - name: Enable and start PatchMaster agent
       ansible.builtin.systemd_service:
-        name: endpoint-agent
+        name: "{{ patchmaster_service }}"
         enabled: true
         state: restarted
 
-    # 14. Verify service
 
-    - name: Wait for active service
+    # ==========================================================
+    # 15. VERIFY SERVICE
+    # ==========================================================
+
+    - name: Wait for active agent service
       ansible.builtin.command:
         argv:
           - systemctl
           - is-active
-          - endpoint-agent
+          - "{{ patchmaster_service }}"
       register: patchmaster_active
       changed_when: false
       retries: 12
       delay: 5
       until: patchmaster_active.rc == 0
 
-    # 15. Get installed version
 
-    - name: Get PatchMaster version
+    # ==========================================================
+    # 16. GET INSTALLED VERSION
+    # ==========================================================
+
+    - name: Get PatchMaster agent version
       ansible.builtin.command:
         argv:
-          - /usr/local/bin/endpoint-agent
+          - "{{ patchmaster_binary }}"
           - -version
       register: patchmaster_version
       changed_when: false
       failed_when: false
 
-    # 16. Collect enrollment logs
+
+    # ==========================================================
+    # 17. COLLECT AGENT LOGS
+    # ==========================================================
 
     - name: Get recent PatchMaster logs
       ansible.builtin.command:
         argv:
           - journalctl
           - -u
-          - endpoint-agent
+          - "{{ patchmaster_service }}"
           - -n
           - "50"
           - --no-pager
@@ -259,25 +436,44 @@
       changed_when: false
       failed_when: false
 
-    # 17. Deployment report
+
+    # ==========================================================
+    # 18. FINAL DEPLOYMENT REPORT
+    # ==========================================================
 
     - name: Display PatchMaster deployment report
       ansible.builtin.debug:
         msg:
+          - "========================================"
+          - "PATCHMASTER DEPLOYMENT REPORT"
+          - "========================================"
           - "Endpoint: {{ inventory_hostname }}"
-          - "Installer: SUCCESS"
-          - "Configuration: MATCH"
-          - "Agent Version: {{ patchmaster_version.stdout | default('Unavailable') }}"
-          - "Service: {{ patchmaster_active.stdout }}"
-          - "Recent logs:"
+          - "OS: {{ ansible_distribution | default('Linux') }}"
+          - "Installation mode: {{ 'UPGRADE' if patchmaster_existing_install else 'FRESH INSTALL' }}"
+          - "Target version: v2.3"
+          - "Agent version: {{ patchmaster_version.stdout | default('Unavailable') }}"
+          - "Service status: {{ patchmaster_active.stdout | default('Unknown') }}"
+          - "Configuration preserved: {{ 'YES' if patchmaster_existing_install else 'NEW CONFIGURATION' }}"
+          - "Enrollment state preserved: {{ 'YES' if patchmaster_existing_install else 'NEW ENROLLMENT REQUIRED' }}"
+          - "========================================"
+          - "RECENT AGENT LOGS"
           - "{{ patchmaster_logs.stdout | default('Unavailable') }}"
+          - "========================================"
 
-    # 18. Final validation
+
+    # ==========================================================
+    # 19. FINAL VALIDATION
+    # ==========================================================
 
     - name: Validate deployment
       ansible.builtin.assert:
         that:
-          - patchmaster_install.rc == 0
-          - patchmaster_config.rc == 0
           - patchmaster_active.rc == 0
-        success_msg: "PatchMaster deployment completed successfully."
+          - patchmaster_version.rc == 0
+          - >-
+            patchmaster_existing_install
+            or patchmaster_fresh_install.rc == 0
+        success_msg: >-
+          PatchMaster v2.3 deployment completed.
+          Mode: {{ 'UPGRADE' if patchmaster_existing_install else 'FRESH INSTALL' }}
+        fail_msg: "PatchMaster deployment validation failed."
